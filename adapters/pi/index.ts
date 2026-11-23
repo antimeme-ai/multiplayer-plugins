@@ -2,30 +2,179 @@
  * Pi Coding Agent extension for multiplayer.tech (`mp-outpost`).
  *
  * Uses `execFile` exclusively (zero shell interpolation), refuses outbound secret
- * material before spawning any subprocess, and wraps remote peer output in
- * per-response CSPRNG nonce fences matching `outpost-core/src/fence.rs`.
+ * material (including zero-width/fullwidth/hyphen obfuscation) before spawning any
+ * subprocess, sanitizes all peer metadata, and wraps every remote peer event kind
+ * in per-response CSPRNG nonce fences matching `outpost-core/src/fence.rs`.
  */
 
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+
+const RECOVERY_KEY_DOMAIN_SEP = Buffer.from("mp-recovery-v1:", "utf8");
+const MAX_RECOVERY_WINDOW_TOKENS = 16;
+const MAX_RECOVERY_WINDOW_SPAN = 160;
+const RECOVERY_SEPS = new Set([..."-_.,/:| \t\r\n\f\v"]);
+
+const CROCKFORD_MAP: Readonly<Record<string, number>> = {
+  "0": 0, O: 0, o: 0,
+  "1": 1, I: 1, i: 1, L: 1, l: 1,
+  "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+  A: 10, a: 10, B: 11, b: 11, C: 12, c: 12, D: 13, d: 13,
+  E: 14, e: 14, F: 15, f: 15, G: 16, g: 16, H: 17, h: 17,
+  J: 18, j: 18, K: 19, k: 19, M: 20, m: 20, N: 21, n: 21,
+  P: 22, p: 22, Q: 23, q: 23, R: 24, r: 24, S: 25, s: 25,
+  T: 26, t: 26, V: 27, v: 27, W: 28, w: 28, X: 29, x: 29,
+  Y: 30, y: 30, Z: 31, z: 31,
+};
 
 const SECRET_PATTERNS: ReadonlyArray<{ kind: string; re: RegExp }> = [
   { kind: "invite_token", re: /(?:^|[^a-zA-Z0-9])mpinv1_[A-Za-z0-9_-]{43,}/i },
   { kind: "party_invite", re: /(?:^|[^a-zA-Z0-9])mppi1_[0-9]+_[A-Za-z0-9_-]{43,}/i },
   { kind: "device_link_token", re: /(?:^|[^a-zA-Z0-9])mpdl1_[A-Za-z0-9_-]{43,}/i },
-  { kind: "recovery_key", re: /mprk1_[A-Za-z0-9\-_]{32,}/i },
   { kind: "private_key_pem", re: /-----BEGIN [A-Z0-9 -]{0,48}(?:PRIVATE|RECOVERY|SECRET) KEY-----/i },
-  { kind: "mpkey_backup", re: /"format"\s*:\s*"mpkey"|MPKEY1/i },
+  { kind: "recovery_file", re: /"format"\s*:\s*"mpkey"|MPKEY1|"kdf"\s*:\s*"argon2id"[\s\S]{0,256}"ciphertext"/i },
+  {
+    kind: "device_credential",
+    re: /["']?(?:device_secret|device_cwt|root_key_hex|root_secret)["']?\s*[:=]\s*["']?[A-Za-z0-9+/=_-]{16,}/i,
+  },
 ];
 
-export function detectForbiddenSecret(text: string): string | null {
-  for (const { kind, re } of SECRET_PATTERNS) {
-    if (re.test(text)) {
-      return kind;
+function normalizeForSecretScan(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp === 0x00ad || (cp >= 0x200b && cp <= 0x200f) || cp === 0x2060 || cp === 0xfeff) {
+      continue;
     }
+    if (cp >= 0xff01 && cp <= 0xff5e) {
+      out += String.fromCodePoint(cp - 0xff01 + 0x21);
+    } else if ((cp >= 0x2010 && cp <= 0x2015) || cp === 0x2212) {
+      out += "-";
+    } else if (cp === 0x3000) {
+      out += " ";
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+function verifyUnprefixedRecoveryWindow(syms: number[]): boolean {
+  if (syms.length !== 55 || (syms[54] & 0x07) !== 0) {
+    return false;
+  }
+  if (new Set(syms).size <= 1) {
+    return false;
+  }
+  const payload = Buffer.alloc(34);
+  let outIdx = 0;
+  let bitBuf = 0;
+  let bitLen = 0;
+  for (const val of syms) {
+    bitBuf = (bitBuf << 5) | val;
+    bitLen += 5;
+    while (bitLen >= 8) {
+      bitLen -= 8;
+      payload[outIdx++] = (bitBuf >> bitLen) & 0xff;
+    }
+  }
+  if (outIdx !== 34 || bitLen !== 3 || (bitBuf & 0x07) !== 0) {
+    return false;
+  }
+  const digest = createHash("sha256")
+    .update(RECOVERY_KEY_DOMAIN_SEP)
+    .update(payload.subarray(0, 32))
+    .digest();
+  return payload[32] === digest[0] && payload[33] === digest[1];
+}
+
+function containsRecoveryKey(norm: string): boolean {
+  const lower = norm.toLowerCase();
+  let start = 0;
+  while (true) {
+    const idx = lower.indexOf("mprk1_", start);
+    if (idx < 0) break;
+    start = idx + 6;
+    const win = norm.slice(start, start + 256);
+    if (!win || win[0] === " " || win[0] === "\t") continue;
+    const vals: number[] = [];
+    for (const ch of win) {
+      const val = CROCKFORD_MAP[ch];
+      if (val !== undefined) {
+        vals.push(val);
+        if (vals.length >= 40 && new Set(vals.slice(0, 40)).size >= 2) {
+          return true;
+        }
+        if (vals.length >= 55) break;
+      } else if (RECOVERY_SEPS.has(ch)) {
+        continue;
+      } else {
+        break;
+      }
+    }
+  }
+
+  let i = 0;
+  while (i < norm.length) {
+    if (CROCKFORD_MAP[norm[i]] === undefined || (i > 0 && CROCKFORD_MAP[norm[i - 1]] !== undefined)) {
+      i += 1;
+      continue;
+    }
+    const syms: Array<{ val: number; pos: number; startB: boolean; endB: boolean }> = [];
+    let j = i;
+    let atBoundary = true;
+    while (j < norm.length) {
+      const ch = norm[j];
+      const val = CROCKFORD_MAP[ch];
+      if (val !== undefined) {
+        syms.push({ val, pos: j, startB: atBoundary, endB: false });
+        atBoundary = false;
+        j += 1;
+      } else if (RECOVERY_SEPS.has(ch)) {
+        if (syms.length > 0) syms[syms.length - 1].endB = true;
+        atBoundary = true;
+        j += 1;
+      } else {
+        break;
+      }
+    }
+    if (syms.length > 0) syms[syms.length - 1].endB = true;
+    if (syms.length >= 55) {
+      for (let k = 0; k <= syms.length - 55; k++) {
+        const first = syms[k];
+        const last = syms[k + 54];
+        if (!first.startB || !last.endB) continue;
+        if (last.pos - first.pos > MAX_RECOVERY_WINDOW_SPAN) continue;
+        let tokenStarts = 0;
+        for (let m = k; m < k + 55; m++) {
+          if (syms[m].startB) tokenStarts += 1;
+        }
+        if (tokenStarts > MAX_RECOVERY_WINDOW_TOKENS) continue;
+        if (verifyUnprefixedRecoveryWindow(syms.slice(k, k + 55).map((s) => s.val))) {
+          return true;
+        }
+      }
+    }
+    i = j + 1;
+  }
+  return false;
+}
+
+export function detectForbiddenSecret(text: string): string | null {
+  const norm = normalizeForSecretScan(text);
+  const candidates = norm === text ? [text] : [text, norm];
+  for (const candidate of candidates) {
+    for (const { kind, re } of SECRET_PATTERNS) {
+      if (re.test(candidate)) {
+        return kind;
+      }
+    }
+  }
+  if (containsRecoveryKey(norm)) {
+    return "recovery_key";
   }
   return null;
 }
@@ -74,6 +223,41 @@ export function fencePeerText(raw: string): string {
     `${safe}\n` +
     `<<<BLACKBIRD_UNTRUSTED_PEER_DATA_END_${nonce}>>>`
   );
+}
+
+export interface OutpostPartyEvent {
+  event_seq: number;
+  kind: string;
+  sender_handle?: string;
+  sender_account_id?: number;
+  room_scope?: string;
+  body?: string;
+  text?: string;
+  payload_b64?: string;
+  summary?: string;
+}
+
+export function formatPartyEvent(ev: OutpostPartyEvent): string {
+  const kind = sanitizePeerText(String(ev.kind ?? "unknown"));
+  const handle = sanitizePeerText(String(ev.sender_handle ?? "system"));
+  const accountId = Number.isSafeInteger(ev.sender_account_id) ? ev.sender_account_id : 0;
+  const header = `[seq=${ev.event_seq} kind=${kind} from=${handle}(${accountId})]`;
+
+  let payloadRaw: string;
+  if (ev.kind === "chat_message") {
+    payloadRaw = String(ev.body ?? "");
+  } else if (ev.kind === "control_notice") {
+    payloadRaw = String(ev.text ?? "");
+  } else if (ev.kind === "bridge_envelope") {
+    const scope = sanitizePeerText(String(ev.room_scope ?? ""));
+    payloadRaw = `scope: ${scope}\npayload_b64: ${String(ev.payload_b64 ?? "")}`;
+  } else if (ev.kind === "membership_changed") {
+    payloadRaw = String(ev.summary ?? "");
+  } else {
+    payloadRaw = JSON.stringify(ev);
+  }
+
+  return `${header}\n${fencePeerText(payloadRaw)}`;
 }
 
 async function runOutpostJson(args: string[], timeoutMs = 15_000): Promise<unknown> {
@@ -157,18 +341,9 @@ export default function multiplayerExtension(pi: PiExtensionAPI): void {
           "--limit",
           "20",
         ])) as {
-          events?: Array<{
-            event_seq: number;
-            kind: string;
-            sender_handle?: string;
-            sender_account_id?: number;
-            body?: string;
-          }>;
+          events?: OutpostPartyEvent[];
         };
-        const lines = (poll.events ?? []).map((ev) => {
-          const header = `[seq=${ev.event_seq} kind=${ev.kind} from=${ev.sender_handle ?? "system"}(${ev.sender_account_id ?? 0})]`;
-          return ev.body ? `${header}\n${fencePeerText(ev.body)}` : header;
-        });
+        const lines = (poll.events ?? []).map((ev) => formatPartyEvent(ev));
         ctx.notify(lines.length ? lines.join("\n\n") : `Party #${partyId}: no events.`, "info");
       } catch (err) {
         ctx.notify(`mp-outpost party read failed: ${(err as Error).message}`, "error");

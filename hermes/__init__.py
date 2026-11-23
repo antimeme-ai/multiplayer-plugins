@@ -77,7 +77,7 @@ def build_hermes_mcp_entry(
         "connect_timeout": int(connect_timeout),
     }
     if state_dir:
-        entry["env"] = {"MP_OUTPOST_STATE_DIR": state_dir}
+        entry["env"] = {"OUTPOST_STATE_DIR": state_dir}
     return entry
 
 
@@ -395,7 +395,7 @@ def _setup_cli_parser(subparser: Any) -> None:
     subparser.add_argument("--write", action="store_true", help="Write ~/.hermes/config.yaml during setup.")
     subparser.add_argument("--config", default=None, help="Override Hermes config.yaml path.")
     subparser.add_argument("--binary", default="mp-outpost", help="Path to mp-outpost binary.")
-    subparser.add_argument("--state-dir", default=None, help="Optional MP_OUTPOST_STATE_DIR override.")
+    subparser.add_argument("--state-dir", default=None, help="Optional OUTPOST_STATE_DIR override.")
     subparser.add_argument(
         "--timeout",
         type=int,

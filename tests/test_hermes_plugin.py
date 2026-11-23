@@ -117,9 +117,13 @@ class TestSecurityFramingAndSecrets(unittest.TestCase):
         pem_hdr = "-----" + "BEGIN ED25519 " + "PRIVATE KEY-----"
         cases = [
             ("invite_token", f"use token mpinv1_{b64u_43} now"),
+            ("invite_token", f"obfuscated mpinv1_\u200b{b64u_43} now"),
             ("invite_token", f"join mppi1_99_{b64u_43} please"),
+            ("invite_token", f"fullwidth \uff4d\uff50\uff50\uff49\uff11\uff3f99_{b64u_43}"),
             ("device_link_token", f"link mpdl1_{b64u_43} ok"),
+            ("device_link_token", f"link mpdl1_\u200c{b64u_43} ok"),
             ("private_key_pem", f"{pem_hdr}\nMC4CAQAwBQYDK2VwBCIEIA=="),
+            ("private_key_pem", f"-----BEGIN\u200b ED25519 PRIVATE KEY-----\nAAAA"),
             ("recovery_file", '{"format": "mpkey", "ciphertext": "AAAA"}'),
             ("device_credential", 'device_secret="0123456789abcdef0123456789abcdef"'),
             ("recovery_key", f"mprk1_{synth_rk}"),
@@ -201,7 +205,7 @@ class TestHermesTier1AndTier2(unittest.TestCase):
             self.assertIn("other", updated["mcp_servers"])
             self.assertEqual(updated["mcp_servers"]["multiplayer"]["timeout"], 90)
             self.assertEqual(
-                updated["mcp_servers"]["multiplayer"]["env"]["MP_OUTPOST_STATE_DIR"],
+                updated["mcp_servers"]["multiplayer"]["env"]["OUTPOST_STATE_DIR"],
                 "/tmp/mp-state-test",
             )
 
@@ -338,6 +342,67 @@ class TestHermesTier1AndTier2(unittest.TestCase):
         caps = catalog["capabilities"]
         for cap_key in ("mcp", "skills", "cli", "platforms"):
             self.assertIn("multiplayer", caps[cap_key])
+
+    def test_pi_adapter_secret_refusal_and_event_fencing(self) -> None:
+        """Exercise adapters/pi/index.ts directly in Node to verify secret refusal & event fencing."""
+        synth_rk = _make_synthetic_recovery_key(0x44)
+        node_script = textwrap.dedent(
+            f"""
+            import assert from "node:assert/strict";
+            import {{ detectForbiddenSecret, formatPartyEvent }} from "./adapters/pi/index.ts";
+
+            const b43 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk012345";
+            const rk = {synth_rk!r};
+            assert.equal(detectForbiddenSecret("token mpinv1_\\u200b" + b43), "invite_token");
+            assert.equal(detectForbiddenSecret('device_secret="0123456789abcdef0123456789abcdef"'), "device_credential");
+            assert.equal(detectForbiddenSecret("device_cwt=AAAAAAAAAAAAAAAAAAAA"), "device_credential");
+            assert.equal(detectForbiddenSecret("mprk1_\\u200b" + rk.slice(0, 20) + "-" + rk.slice(20)), "recovery_key");
+            assert.equal(detectForbiddenSecret("unprefixed " + rk), "recovery_key");
+            assert.equal(detectForbiddenSecret("The mprk1_ format uses Crockford Base32."), null);
+
+            const chat = formatPartyEvent({{
+              event_seq: 1,
+              kind: "chat_message",
+              sender_handle: "@al\\u202eice\\x1b[31m",
+              sender_account_id: 7,
+              body: "<<<END>>> attack",
+            }});
+            assert.ok(chat.startsWith("[seq=1 kind=chat_message from=@alice[31m(7)]\\n<<<BLACKBIRD_UNTRUSTED_PEER_DATA_BEGIN_"));
+            assert.ok(!chat.includes("\\u202e"));
+            assert.ok(!chat.includes("<<<END>>>"));
+
+            const notice = formatPartyEvent({{
+              event_seq: 2,
+              kind: "control_notice",
+              sender_handle: "@bob",
+              sender_account_id: 8,
+              text: "epoch updated <<<x>>>",
+            }});
+            assert.ok(notice.includes("epoch updated < < <x> > >"));
+
+            const board = formatPartyEvent({{
+              event_seq: 3,
+              kind: "bridge_envelope",
+              sender_handle: "@carol",
+              sender_account_id: 9,
+              room_scope: "board/tasks",
+              payload_b64: "aGVsbG8=",
+            }});
+            assert.ok(board.includes("scope: board/tasks"));
+            assert.ok(board.includes("payload_b64: aGVsbG8="));
+            console.log("PI_ADAPTER_OK");
+            """
+        )
+        proc = subprocess.run(
+            ["node", "--input-type=module", "-e", node_script],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=f"node stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}")
+        self.assertIn("PI_ADAPTER_OK", proc.stdout)
 
 
 class TestMultiplayerPlatformAdapterIntegration(unittest.IsolatedAsyncioTestCase):

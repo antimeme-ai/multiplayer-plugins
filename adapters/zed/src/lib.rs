@@ -13,6 +13,46 @@ struct MultiplayerOutpostExtension {
     cached_binary_path: Option<String>,
 }
 
+/// Strictly validates a GitHub release version tag as semver (`vMAJOR.MINOR.PATCH[-PRE]`)
+/// with zero path separators or traversal sequences before using it in local paths.
+fn validate_semver_version(raw: &str) -> Result<&str> {
+    let trimmed = raw.strip_prefix('v').unwrap_or(raw);
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err(format!("refused unsafe release version '{raw}'"));
+    }
+
+    let (core, pre) = match trimmed.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (trimmed, None),
+    };
+
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(format!("invalid semver core in release version '{raw}'"));
+    }
+
+    if let Some(prerelease) = pre {
+        if prerelease.is_empty()
+            || !prerelease
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return Err(format!("invalid semver prerelease in release version '{raw}'"));
+        }
+    }
+
+    Ok(trimmed)
+}
+
 impl MultiplayerOutpostExtension {
     fn platform_target() -> Result<&'static str> {
         let (os, arch) = zed::current_platform();
@@ -42,7 +82,7 @@ impl MultiplayerOutpostExtension {
             },
         )?;
 
-        let version = release.version.trim_start_matches('v');
+        let version = validate_semver_version(&release.version)?;
         let dir_name = format!("{BINARY_NAME}-v{version}-{target}");
         let asset_name = format!("{dir_name}.tar.gz");
 
@@ -52,12 +92,21 @@ impl MultiplayerOutpostExtension {
             .find(|a| a.name == asset_name)
             .ok_or_else(|| {
                 format!(
-                    "no release asset matching '{asset_name}' in {GITHUB_REPO} {}",
-                    release.version
+                    "no release asset matching '{asset_name}' in {GITHUB_REPO} v{version}"
                 )
             })?;
 
-        let version_dir = format!("mp-outpost-{}", release.version);
+        let expected_prefix = format!(
+            "https://github.com/{GITHUB_REPO}/releases/download/"
+        );
+        if !asset.download_url.starts_with(&expected_prefix) {
+            return Err(format!(
+                "refused unexpected release asset URL '{}'",
+                asset.download_url
+            ));
+        }
+
+        let version_dir = format!("mp-outpost-v{version}");
         let binary_path = PathBuf::from(&version_dir)
             .join(&dir_name)
             .join(BINARY_NAME);

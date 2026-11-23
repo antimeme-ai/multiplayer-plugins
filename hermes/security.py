@@ -234,20 +234,27 @@ def _contains_recovery_key(text: str) -> bool:
 
 
 def detect_secret_kind(payload: str | bytes) -> str | None:
-    """Return the matched secret kind if payload contains forbidden secret material."""
-    text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else payload
+    """Return the matched secret kind if payload contains forbidden secret material.
 
-    if _INVITE_RE.search(text) or _PARTY_INVITE_RE.search(text):
-        return "invite_token"
-    if _DEVICE_LINK_RE.search(text):
-        return "device_link_token"
-    if _PEM_PRIVATE_RE.search(text):
-        return "private_key_pem"
-    if _MPKEY_RE.search(text):
-        return "recovery_file"
-    if _DEVICE_CRED_RE.search(text):
-        return "device_credential"
-    if _contains_recovery_key(text):
+    Checks both raw text and zero-width/fullwidth/dash-normalized text so obfuscated
+    tokens (e.g., ``mpinv1_\\u200b...`` or fullwidth PEM headers) cannot bypass refusal.
+    """
+    text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else payload
+    norm = _normalize_recovery_chars(text)
+    candidates = (text, norm) if norm != text else (text,)
+
+    for candidate in candidates:
+        if _INVITE_RE.search(candidate) or _PARTY_INVITE_RE.search(candidate):
+            return "invite_token"
+        if _DEVICE_LINK_RE.search(candidate):
+            return "device_link_token"
+        if _PEM_PRIVATE_RE.search(candidate):
+            return "private_key_pem"
+        if _MPKEY_RE.search(candidate):
+            return "recovery_file"
+        if _DEVICE_CRED_RE.search(candidate):
+            return "device_credential"
+    if _contains_recovery_key(norm):
         return "recovery_key"
     return None
 
