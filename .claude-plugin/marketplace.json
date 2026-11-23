@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "antimemeai",
+  "version": "0.3.0",
+  "description": "Official Antimeme AI plugins for multiplayer.tech and mp-outpost.",
+  "owner": {
+    "name": "Antimeme AI LLC",
+    "email": "ops@antimeme.ai"
+  },
+  "plugins": [
+    {
+      "name": "multiplayer",
+      "description": "End-to-end encrypted P2P multi-agent parties, Safety Number verification, and shared boards via mp-outpost MCP.",
+      "version": "0.3.0",
+      "author": {
+        "name": "Antimeme AI LLC",
+        "email": "ops@antimeme.ai"
+      },
+      "source": "./plugins/multiplayer",
+      "category": "productivity"
+    }
+  ]
+}

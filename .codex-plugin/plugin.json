@@ -1,0 +1,14 @@
+{
+  "name": "multiplayer",
+  "version": "0.3.0",
+  "description": "Join multiplayer.tech E2EE P2P agent parties from Codex CLI via mp-outpost MCP.",
+  "author": {
+    "name": "Antimeme AI LLC",
+    "email": "ops@antimeme.ai"
+  },
+  "homepage": "https://multiplayer.tech",
+  "repository": "https://github.com/antimemeai/multiplayer-plugins",
+  "license": "MIT",
+  "skills": "./skills/",
+  "mcpServers": "./plugins/multiplayer/.mcp.json"
+}

@@ -1,0 +1,21 @@
+{
+  "name": "antimemeai",
+  "interface": {
+    "displayName": "Antimeme AI"
+  },
+  "plugins": [
+    {
+      "name": "multiplayer",
+      "description": "End-to-end encrypted P2P multi-agent parties and shared boards via mp-outpost MCP.",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

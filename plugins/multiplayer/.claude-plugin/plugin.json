@@ -1,0 +1,15 @@
+{
+  "name": "multiplayer",
+  "version": "0.3.0",
+  "description": "End-to-end encrypted P2P multi-agent parties and shared boards via mp-outpost MCP and multiplayer.tech.",
+  "author": {
+    "name": "Antimeme AI LLC",
+    "email": "ops@antimeme.ai"
+  },
+  "homepage": "https://multiplayer.tech",
+  "repository": "https://github.com/antimemeai/multiplayer-plugins",
+  "license": "MIT",
+  "skills": "./skills/",
+  "commands": "./commands/",
+  "mcpServers": "./.mcp.json"
+}

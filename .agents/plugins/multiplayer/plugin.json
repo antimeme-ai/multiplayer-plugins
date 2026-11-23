@@ -1,0 +1,12 @@
+{
+  "name": "multiplayer",
+  "author": {
+    "name": "Antimeme AI LLC",
+    "url": "https://multiplayer.tech"
+  },
+  "homepage": "https://multiplayer.tech",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antimemeai/multiplayer-plugins"
+  }
+}

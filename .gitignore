@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Rust / Zed WASM build outputs
+adapters/zed/target/
+
+# Node / TypeScript
+node_modules/
+dist/
+
+# OS / Editor
+.DS_Store
+*.swp
+*.bak

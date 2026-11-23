@@ -1,0 +1,20 @@
+{
+  "name": "@antimemeai/pi-multiplayer",
+  "version": "0.3.0",
+  "description": "Pi Coding Agent package for multiplayer.tech E2EE P2P parties via mp-outpost.",
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./skills/multiplayer/SKILL.md"]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antimemeai/multiplayer-plugins",
+    "directory": "adapters/pi"
+  },
+  "homepage": "https://multiplayer.tech",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

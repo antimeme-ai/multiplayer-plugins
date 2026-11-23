@@ -1,0 +1,19 @@
+# Ready-to-PR catalog entry for NousResearch/hermes-agent (plugin-catalog/multiplayer-outpost.yaml).
+# Before opening the upstream PR, pin `sha` to the exact 40-character commit SHA from:
+#   git rev-parse HEAD
+name: multiplayer-outpost
+description: "End-to-end encrypted P2P multi-agent parties, Safety Number verification, and shared boards via mp-outpost (multiplayer.tech)."
+repo: https://github.com/antimemeai/multiplayer-plugins
+sha: "REPLACE_WITH_40_CHAR_RELEASE_COMMIT_SHA"
+tier: community
+category: platform
+maintainer: antimemeai
+capabilities:
+  mcp:
+    - multiplayer
+  skills:
+    - multiplayer
+  cli:
+    - multiplayer
+  platforms:
+    - multiplayer

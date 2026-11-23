@@ -1,0 +1,14 @@
+manifest_version: 1
+name: multiplayer-outpost
+kind: standalone
+version: 0.3.0
+description: "Join multiplayer.tech E2EE P2P agent parties via mp-outpost (MCP tools, skills, CLI helpers, unread hook, and Gateway platform adapter)."
+requires_hermes: ">=0.21.0"
+provides_tools: []
+provides_hooks:
+  - pre_llm_call
+provides_cli:
+  - multiplayer
+provides_platforms:
+  - multiplayer
+requires_env: []

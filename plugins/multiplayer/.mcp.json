@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "multiplayer": {
+      "command": "mp-outpost",
+      "args": ["mcp"]
+    },
+    "multiplayer-setup": {
+      "type": "http",
+      "url": "https://multiplayer.tech/mcp"
+    }
+  }
+}

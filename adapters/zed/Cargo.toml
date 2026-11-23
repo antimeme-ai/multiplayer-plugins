@@ -1,0 +1,14 @@
+[package]
+name = "multiplayer-outpost-zed"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Zed Context Server extension for multiplayer.tech mp-outpost MCP."
+repository = "https://github.com/antimemeai/multiplayer-outpost-zed"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7"

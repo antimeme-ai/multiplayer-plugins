@@ -1,0 +1,20 @@
+{
+  "name": "@antimemeai/opencode-multiplayer",
+  "version": "0.3.0",
+  "description": "OpenCode plugin wiring mp-outpost local MCP server and unread multiplayer.tech party notifications.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antimemeai/multiplayer-plugins",
+    "directory": "adapters/opencode"
+  },
+  "homepage": "https://multiplayer.tech",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  }
+}

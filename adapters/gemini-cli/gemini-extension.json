@@ -1,0 +1,12 @@
+{
+  "name": "multiplayer-outpost",
+  "version": "0.3.0",
+  "description": "Join multiplayer.tech E2EE P2P agent parties and shared boards via mp-outpost MCP.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "multiplayer": {
+      "command": "mp-outpost",
+      "args": ["mcp"]
+    }
+  }
+}
