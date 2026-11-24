@@ -81,7 +81,7 @@ export async function MultiplayerPlugin(
       if (event?.type === "session.created") {
         await log(
           "debug",
-          "Multiplayer Outpost ready; call outpost_status and party_list to inspect active E2EE P2P parties.",
+          "Multiplayer Outpost ready; call outpost_status, party_invite, or party_join to collaborate in mp2 rooms.",
         );
       }
     },

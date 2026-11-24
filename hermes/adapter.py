@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Final
 
 from .security import SecretRefusalError, fence_peer_text, refuse_secrets, sanitize_peer_text
@@ -75,7 +75,7 @@ class OutpostEofError(OutpostError):
 
 @dataclass(frozen=True)
 class PeerProvenance:
-    """Cryptographically verified sender metadata resolved by mp-outpost daemon."""
+    """Verified sender metadata resolved by the mp-outpost daemon."""
 
     party_id: int
     event_seq: int
@@ -128,13 +128,25 @@ def _validate_safe_id(value: int, field_name: str) -> int:
     return value
 
 
+def _validate_safe_cli_token(value: str, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    cleaned = value.strip()
+    if cleaned.startswith("-"):
+        raise ValueError(f"{field_name} cannot start with '-'")
+    refuse_secrets(cleaned)
+    return cleaned
+
+
 class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
     """Hermes Gateway platform adapter for multiplayer.tech via ``mp-outpost``.
 
     Security invariants:
     - Never reads ``root.key``, ``.mpkey``, ``device_secret``, or Hermes secret stores.
     - Refuses outbound secrets BEFORE spawning ``mp-outpost`` (secrets never enter argv).
-    - Wraps every inbound remote peer payload in a fresh per-message CSPRNG nonce fence.
+    - Wraps every inbound remote peer payload (including ``chat_message``, ``agent_card``,
+      ``control_notice``, ``bridge_envelope``, and ``membership_changed``) in a fresh
+      per-message CSPRNG nonce fence.
     - Enforces bounded timeouts and clean ``SIGTERM``/``SIGKILL`` child shutdown.
     """
 
@@ -267,7 +279,53 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return await self._run_json(["party", "members", str(pid)], timeout_s=self.subprocess_grace_s)
 
     async def friends(self) -> dict[str, Any]:
-        return await self._run_json(["friend", "list"], timeout_s=self.subprocess_grace_s)
+        """List friends, live presence, and pending invites (falls back to `friend list` on older binaries)."""
+        try:
+            return await self._run_json(["friends"], timeout_s=self.subprocess_grace_s)
+        except OutpostError as exc:
+            if "unknown subcommand" in str(exc).lower():
+                return await self._run_json(["friend", "list"], timeout_s=self.subprocess_grace_s)
+            raise
+
+    async def add_friend(self, handle: str) -> dict[str, Any]:
+        """Send or accept a friend request by ``@handle`` after pre-exec secret refusal."""
+        clean_handle = _validate_safe_cli_token(handle, "handle")
+        return await self._run_json(["add", clean_handle], timeout_s=self.subprocess_grace_s)
+
+    async def invite(
+        self,
+        handle: str | None = None,
+        *,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or reuse an active mp2 party room and optionally ring ``@handle``."""
+        args = ["invite"]
+        if handle is not None and handle.strip():
+            args.append(_validate_safe_cli_token(handle, "handle"))
+        if name is not None and name.strip():
+            args.extend(["--name", _validate_safe_cli_token(name, "name")])
+        return await self._run_json(args, timeout_s=self.subprocess_grace_s)
+
+    async def join(
+        self,
+        target: str | None = None,
+        *,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Join an mp2 party by @handle, room code, share URL, or accept latest invite when target is None."""
+        args = ["join"]
+        if target is not None and target.strip():
+            args.append(_validate_safe_cli_token(target, "target"))
+        if agent_name is not None and agent_name.strip():
+            args.extend(["--agent-name", _validate_safe_cli_token(agent_name, "agent_name")])
+        return await self._run_json(args, timeout_s=self.subprocess_grace_s)
+
+    async def leave(self, party_id: int | None = None) -> dict[str, Any]:
+        """Leave the active party room (or an explicit ``party_id``)."""
+        args = ["leave"]
+        if party_id is not None:
+            args.append(str(_validate_safe_id(party_id, "party_id")))
+        return await self._run_json(args, timeout_s=self.subprocess_grace_s)
 
     async def send_message(
         self,
@@ -277,7 +335,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         room_scope: str = "party/main",
         target_device_id: int | None = None,
     ) -> dict[str, Any]:
-        """Send an outbound P2P chat message after strict pre-exec secret refusal."""
+        """Send an outbound party chat message after strict pre-exec secret refusal."""
         pid = _validate_safe_id(party_id, "party_id")
         if not isinstance(body, str) or not body:
             raise ValueError("body must be a non-empty string")
@@ -313,28 +371,44 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def format_inbound_event(party_id: int, raw_event: dict[str, Any]) -> FencedPeerMessage:
         """Convert a raw mp-outpost JSON event into a provenance-fenced message."""
         kind = str(raw_event.get("kind", "unknown"))
-        event_seq = int(raw_event.get("event_seq", 0))
+        event_seq = int(raw_event.get("event_seq", raw_event.get("seq", 0)))
         provenance = PeerProvenance(
             party_id=party_id,
             event_seq=event_seq,
             kind=kind,
             sender_account_id=int(raw_event.get("sender_account_id", 0)),
             sender_device_id=int(raw_event.get("sender_device_id", 0)),
-            sender_handle=sanitize_peer_text(str(raw_event.get("sender_handle", ""))),
+            sender_handle=sanitize_peer_text(str(raw_event.get("sender_handle", raw_event.get("from", "")))),
             safety_number=sanitize_peer_text(str(raw_event.get("safety_number", ""))),
             room_scope=sanitize_peer_text(str(raw_event.get("room_scope", ""))),
             party_epoch=int(raw_event.get("party_epoch", 0)),
-            untrusted_remote=bool(raw_event.get("untrusted_remote", kind != "membership_changed")),
+            untrusted_remote=bool(
+                raw_event.get("untrusted_remote", kind not in ("membership_changed", "system"))
+            ),
         )
 
-        if kind == "chat_message":
+        if kind in ("chat_message", "chat"):
             payload_raw = str(raw_event.get("body", ""))
+        elif kind == "agent_card":
+            if raw_event.get("body") is not None:
+                body_val = raw_event["body"]
+                card_text = body_val if isinstance(body_val, str) else json.dumps(body_val, sort_keys=True)
+            elif raw_event.get("card") is not None:
+                card_val = raw_event["card"]
+                card_text = card_val if isinstance(card_val, str) else json.dumps(card_val, sort_keys=True)
+            else:
+                card_text = json.dumps(raw_event, sort_keys=True)
+            payload_raw = (
+                f"scope: {provenance.room_scope}\n{card_text}"
+                if provenance.room_scope
+                else card_text
+            )
         elif kind == "control_notice":
             payload_raw = str(raw_event.get("text", ""))
         elif kind == "bridge_envelope":
             payload_raw = f"scope: {provenance.room_scope}\npayload_b64: {raw_event.get('payload_b64', '')}"
-        elif kind == "membership_changed":
-            payload_raw = str(raw_event.get("summary", ""))
+        elif kind in ("membership_changed", "system"):
+            payload_raw = str(raw_event.get("summary") or raw_event.get("body") or "")
         else:
             payload_raw = json.dumps(raw_event, sort_keys=True)
 
@@ -487,6 +561,7 @@ __all__ = [
     "DEFAULT_SUBPROCESS_GRACE_S",
     "FencedPeerMessage",
     "MAX_PARTY_WAIT_MS",
+    "MAX_SAFE_ID",
     "MultiplayerPlatformAdapter",
     "OutpostEofError",
     "OutpostError",

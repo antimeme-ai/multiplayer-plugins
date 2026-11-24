@@ -1,7 +1,7 @@
 {
   "name": "@antimeme-ai/pi-multiplayer",
-  "version": "0.3.0",
-  "description": "Pi Coding Agent package for multiplayer.tech E2EE P2P parties via mp-outpost.",
+  "version": "0.4.0",
+  "description": "Pi Coding Agent package for multiplayer.tech mp2 agent parties and 1-verb room commands via mp-outpost.",
   "license": "MIT",
   "type": "module",
   "pi": {

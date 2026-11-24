@@ -1,10 +1,11 @@
 """Nous Research Hermes Agent plugin for multiplayer.tech (`mp-outpost`).
 
 Implements all three integration tiers:
-- Tier 1: MCP config snippet generator & atomic ``~/.hermes/config.yaml`` upserter
+- Tier 1: MCP config snippet generator & atomic Hermes YAML config upserter
   (``timeout: 90``, ``connect_timeout: 30`` for ``party_wait`` max 45 s).
-- Tier 2: ``hermes multiplayer`` CLI commands (``setup``, ``status``, ``doctor``,
-  ``parties``, ``friends``) and non-blocking ``pre_llm_call`` unread-message hook.
+- Tier 2: 1-verb ``hermes multiplayer`` CLI commands (``login``, ``add``, ``invite``,
+  ``join``, ``leave``, ``friends``, ``setup``, ``status``, ``doctor``, ``parties``)
+  and non-blocking ``pre_llm_call`` unread-message hook.
 - Tier 3: ``MultiplayerPlatformAdapter`` Gateway platform adapter registered via
   ``ctx.register_platform("multiplayer", MultiplayerPlatformAdapter)``.
 """
@@ -23,6 +24,7 @@ import yaml
 from .adapter import (
     BasePlatformAdapter,
     FencedPeerMessage,
+    MAX_SAFE_ID,
     MultiplayerPlatformAdapter,
     OutpostEofError,
     OutpostError,
@@ -41,10 +43,22 @@ from .security import (
 )
 
 PLUGIN_NAME: Final[str] = "multiplayer-outpost"
-PLUGIN_VERSION: Final[str] = "0.3.0"
+PLUGIN_VERSION: Final[str] = "0.4.0"
 DEFAULT_HERMES_MCP_TIMEOUT_S: Final[int] = 90
 DEFAULT_HERMES_CONNECT_TIMEOUT_S: Final[int] = 30
 MIN_PARTY_WAIT_TOOL_TIMEOUT_S: Final[int] = 60
+CLI_ACTIONS: Final[tuple[str, ...]] = (
+    "login",
+    "add",
+    "invite",
+    "join",
+    "leave",
+    "friends",
+    "setup",
+    "status",
+    "doctor",
+    "parties",
+)
 
 CommandRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 
@@ -88,7 +102,7 @@ def render_hermes_mcp_snippet(
     timeout: int = DEFAULT_HERMES_MCP_TIMEOUT_S,
     connect_timeout: int = DEFAULT_HERMES_CONNECT_TIMEOUT_S,
 ) -> str:
-    """Render a copy-pasteable ``~/.hermes/config.yaml`` snippet."""
+    """Render a copy-pasteable Hermes YAML configuration snippet."""
     payload = {
         "mcp_servers": {
             "multiplayer": build_hermes_mcp_entry(
@@ -110,7 +124,7 @@ def upsert_hermes_mcp_config(
     timeout: int = DEFAULT_HERMES_MCP_TIMEOUT_S,
     connect_timeout: int = DEFAULT_HERMES_CONNECT_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Atomically upsert ``mcp_servers.multiplayer`` in ``~/.hermes/config.yaml``.
+    """Atomically upsert ``mcp_servers.multiplayer`` in Hermes YAML configuration.
 
     Creates a ``.bak`` backup when updating an existing file and writes through a
     same-directory temporary file + ``os.replace`` so partial writes cannot corrupt
@@ -192,6 +206,24 @@ def _default_sync_runner(argv: list[str], timeout_s: float) -> subprocess.Comple
         timeout=timeout_s,
         check=False,
     )
+
+
+def _validate_cli_arg(label: str, value: str) -> tuple[str | None, str | None]:
+    """Validate a CLI string argument before spawning mp-outpost.
+
+    Returns ``(clean_value, error_message)``. Refuses leading-dash flag injection
+    and any detected secret material without echoing secret values.
+    """
+    cleaned = value.strip()
+    if not cleaned:
+        return None, f"{label} must be non-empty."
+    if cleaned.startswith("-"):
+        return None, f"Refused {label}: value cannot start with '-'."
+    try:
+        refuse_secrets(cleaned)
+    except SecretRefusalError as exc:
+        return None, str(exc)
+    return cleaned, None
 
 
 class UnreadNotificationHook:
@@ -353,32 +385,109 @@ def handle_cli_command(
         )
         return (
             0,
-            "# Add to ~/.hermes/config.yaml (or re-run with --write), then run /reload-mcp:\n"
+            "# Add to your Hermes YAML config (or re-run with --write), then run /reload-mcp:\n"
             + snippet,
         )
 
-    sub_map: dict[str, list[str]] = {
-        "status": ["party", "status"],
-        "doctor": ["doctor"],
-        "parties": ["party", "list"],
-        "friends": ["friend", "list"],
-    }
-    if action not in sub_map:
-        return (2, f"Unknown subcommand '{action}'. Expected one of: setup, status, doctor, parties, friends.")
+    sub_args: list[str]
+    cmd_timeout_s = 15.0
+    fallback_sub_args: list[str] | None = None
+    target_raw = getattr(args, "target", None)
 
-    argv = [bin_path]
-    if state_dir:
-        argv.extend(["--state-dir", state_dir])
-    if getattr(args, "json", False):
-        argv.append("--json")
-    argv.extend(sub_map[action])
+    if action == "status":
+        sub_args = ["party", "status"]
+    elif action == "doctor":
+        sub_args = ["doctor"]
+    elif action == "parties":
+        sub_args = ["party", "list"]
+    elif action == "friends":
+        sub_args = ["friends"]
+        fallback_sub_args = ["friend", "list"]
+    elif action == "login":
+        sub_args = ["login"]
+        if getattr(args, "no_open", False):
+            sub_args.append("--no-open")
+        device_label = getattr(args, "device_label", None)
+        if device_label is not None:
+            clean_label, err = _validate_cli_arg("device_label", str(device_label))
+            if err:
+                return (2, err)
+            assert clean_label is not None
+            sub_args.extend(["--device-label", clean_label])
+        cmd_timeout_s = 120.0
+    elif action == "add":
+        if target_raw is None or not str(target_raw).strip():
+            return (2, "Usage: hermes multiplayer add @handle")
+        clean_target, err = _validate_cli_arg("handle", str(target_raw))
+        if err:
+            return (2, err)
+        assert clean_target is not None
+        sub_args = ["add", clean_target]
+    elif action == "invite":
+        sub_args = ["invite"]
+        if target_raw is not None and str(target_raw).strip():
+            clean_target, err = _validate_cli_arg("handle", str(target_raw))
+            if err:
+                return (2, err)
+            assert clean_target is not None
+            sub_args.append(clean_target)
+        room_name = getattr(args, "name", None)
+        if room_name is not None and str(room_name).strip():
+            clean_name, err = _validate_cli_arg("name", str(room_name))
+            if err:
+                return (2, err)
+            assert clean_name is not None
+            sub_args.extend(["--name", clean_name])
+    elif action == "join":
+        sub_args = ["join"]
+        if target_raw is not None and str(target_raw).strip():
+            clean_target, err = _validate_cli_arg("target", str(target_raw))
+            if err:
+                return (2, err)
+            assert clean_target is not None
+            sub_args.append(clean_target)
+        agent_name = getattr(args, "agent_name", None)
+        if agent_name is not None and str(agent_name).strip():
+            clean_agent, err = _validate_cli_arg("agent_name", str(agent_name))
+            if err:
+                return (2, err)
+            assert clean_agent is not None
+            sub_args.extend(["--agent-name", clean_agent])
+    elif action == "leave":
+        sub_args = ["leave"]
+        if target_raw is not None and str(target_raw).strip():
+            raw_pid = str(target_raw).strip()
+            try:
+                pid = int(raw_pid)
+            except ValueError:
+                return (2, "party_id for leave must be a positive integer.")
+            if pid < 1 or pid > MAX_SAFE_ID:
+                return (2, f"party_id must be in 1..={MAX_SAFE_ID}.")
+            sub_args.append(str(pid))
+    else:
+        return (2, f"Unknown subcommand '{action}'. Expected one of: {', '.join(CLI_ACTIONS)}.")
+
+    def _build_argv(parts: list[str]) -> list[str]:
+        built = [bin_path]
+        if state_dir:
+            built.extend(["--state-dir", state_dir])
+        if getattr(args, "json", False):
+            built.append("--json")
+        built.extend(parts)
+        return built
 
     try:
-        proc = run_cmd(argv, 15.0)
+        proc = run_cmd(_build_argv(sub_args), cmd_timeout_s)
+        if (
+            proc.returncode != 0
+            and fallback_sub_args is not None
+            and "unknown subcommand" in f"{proc.stderr}\n{proc.stdout}".lower()
+        ):
+            proc = run_cmd(_build_argv(fallback_sub_args), cmd_timeout_s)
     except FileNotFoundError:
         return (127, f"mp-outpost binary '{bin_path}' not found on PATH.")
     except subprocess.TimeoutExpired:
-        return (124, f"mp-outpost {' '.join(sub_map[action])} timed out.")
+        return (124, f"mp-outpost {' '.join(sub_args)} timed out.")
 
     output = (proc.stdout or proc.stderr or "").strip()
     return (proc.returncode, output)
@@ -389,10 +498,20 @@ def _setup_cli_parser(subparser: Any) -> None:
         "action",
         nargs="?",
         default="status",
-        choices=["setup", "status", "doctor", "parties", "friends"],
+        choices=list(CLI_ACTIONS),
         help="Subcommand to execute (default: status).",
     )
-    subparser.add_argument("--write", action="store_true", help="Write ~/.hermes/config.yaml during setup.")
+    subparser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Optional target for add (@handle), invite (@handle), join (@handle|CODE|url), or leave (party_id).",
+    )
+    subparser.add_argument("--name", default=None, help="Optional room name for invite.")
+    subparser.add_argument("--agent-name", default=None, help="Optional agent display name for join.")
+    subparser.add_argument("--no-open", action="store_true", help="Do not launch browser automatically during login.")
+    subparser.add_argument("--device-label", default=None, help="Optional device label for login.")
+    subparser.add_argument("--write", action="store_true", help="Write Hermes YAML config during setup.")
     subparser.add_argument("--config", default=None, help="Override Hermes config.yaml path.")
     subparser.add_argument("--binary", default="mp-outpost", help="Path to mp-outpost binary.")
     subparser.add_argument("--state-dir", default=None, help="Optional OUTPOST_STATE_DIR override.")
@@ -430,7 +549,7 @@ def register(ctx: Any) -> dict[str, Any]:
     if hasattr(ctx, "register_cli_command"):
         ctx.register_cli_command(
             "multiplayer",
-            "Configure and inspect multiplayer.tech mp-outpost MCP & E2EE P2P parties",
+            "Join and operate multiplayer.tech mp2 agent parties and MCP via mp-outpost",
             _setup_cli_parser,
             handle_cli_command,
         )
@@ -453,6 +572,7 @@ def register(ctx: Any) -> dict[str, Any]:
 
 __all__ = [
     "BasePlatformAdapter",
+    "CLI_ACTIONS",
     "DEFAULT_HERMES_CONNECT_TIMEOUT_S",
     "DEFAULT_HERMES_MCP_TIMEOUT_S",
     "FencedPeerMessage",

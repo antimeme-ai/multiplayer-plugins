@@ -1,13 +1,13 @@
 ---
-description: List mutual multiplayer.tech friends and live presence via mp-outpost.
+description: List multiplayer.tech friends, live presence, and pending party invites via mp-outpost.
 ---
 
-# `/friends` — Multiplayer Friends & Presence
+# `/friends` — Multiplayer Friends & Live Presence
 
 1. Call `party_friends` on the `multiplayer` MCP server (`mp-outpost mcp`).
-2. Present a concise summary grouped by relationship state (incoming requests first if present, then mutual friends with online/offline presence and handles).
-3. Note that `party_friends` is read-only. If the operator wants to add, accept, or deny a friend, provide the exact local CLI command to run in their terminal:
-   - `mp-outpost friend add @handle`
-   - `mp-outpost friend accept @handle`
-   - `mp-outpost friend deny @handle`
+2. Present a concise summary grouped by:
+   - Pending incoming party invites (offer `/join` or `party_join` with no target to accept immediately).
+   - Pending incoming friend requests (offer `/add @handle` or `friend_add` to accept).
+   - Mutual friends with live presence (`online`, `in party` with room code/joinable status, or `offline`).
+3. To invite an online friend into a room, use `party_invite` (`handle: "@friend"`). To add a new friend, use `friend_add` (`handle: "@friend"`).
 4. Never send or echo invite tokens, recovery keys, or device credentials.

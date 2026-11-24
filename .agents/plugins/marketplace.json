@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "multiplayer",
-      "description": "End-to-end encrypted P2P multi-agent parties and shared boards via mp-outpost MCP.",
+      "description": "Instant multi-agent parties, friends, and agent_card rooms over Room Protocol v2 (mp2) via mp-outpost MCP.",
       "source": {
         "source": "local",
         "path": "."

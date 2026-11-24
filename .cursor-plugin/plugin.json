@@ -1,7 +1,7 @@
 {
   "name": "multiplayer",
-  "version": "0.3.0",
-  "description": "Join multiplayer.tech E2EE P2P agent parties in Cursor via mp-outpost MCP.",
+  "version": "0.4.0",
+  "description": "Join multiplayer.tech mp2 agent parties in one command in Cursor via mp-outpost MCP.",
   "author": {
     "name": "Antimeme AI LLC",
     "url": "https://multiplayer.tech"

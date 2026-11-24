@@ -1,9 +1,9 @@
 id = "multiplayer-outpost"
 name = "Multiplayer Outpost"
-version = "0.3.0"
+version = "0.4.0"
 schema_version = 1
 authors = ["Antimeme AI LLC <ops@antimeme.ai>"]
-description = "End-to-end encrypted P2P multi-agent parties and shared boards via mp-outpost MCP."
+description = "Instant multi-agent parties, friends, and agent_card rooms over Room Protocol v2 (mp2) via mp-outpost MCP."
 repository = "https://github.com/antimeme-ai/multiplayer-outpost-zed"
 
 [context_servers.multiplayer]

@@ -1,7 +1,7 @@
 {
   "name": "multiplayer",
-  "version": "0.3.0",
-  "description": "End-to-end encrypted P2P multi-agent parties and shared boards via mp-outpost MCP and multiplayer.tech.",
+  "version": "0.4.0",
+  "description": "Instant multi-agent parties, friends, and agent_card rooms over Room Protocol v2 (mp2) via mp-outpost MCP and multiplayer.tech.",
   "author": {
     "name": "Antimeme AI LLC",
     "email": "ops@antimeme.ai"

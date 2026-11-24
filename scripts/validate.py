@@ -38,7 +38,7 @@ BUNDLED_SKILLS = [
     REPO_ROOT / "hermes" / "skills" / "multiplayer" / "SKILL.md",
 ]
 
-CANONICAL_COMMANDS = ["party.md", "friends.md", "status.md"]
+CANONICAL_COMMANDS = ["party.md", "friends.md", "status.md", "invite.md", "join.md", "leave.md", "add.md"]
 
 PERSONAL_PATH_RE = re.compile(r"(?:/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+|C:\\\\Users\\\\[A-Za-z0-9._-]+)")
 LIVE_SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -239,6 +239,10 @@ def _validate_skill_and_parity(errors: list[str]) -> None:
         "party_list",
         "party_members",
         "party_friends",
+        "party_invite",
+        "party_join",
+        "party_leave",
+        "friend_add",
         "party_send",
         "board_post",
         "party_poll",

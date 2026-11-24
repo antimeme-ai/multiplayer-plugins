@@ -1,6 +1,6 @@
 [package]
 name = "multiplayer-outpost-zed"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Zed Context Server extension for multiplayer.tech mp-outpost MCP."

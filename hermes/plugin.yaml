@@ -1,8 +1,8 @@
 manifest_version: 2
 name: multiplayer-outpost
 kind: standalone
-version: "0.3.0"
-description: "Join multiplayer.tech E2EE P2P agent parties via mp-outpost (MCP setup helpers, unread party hook, CLI commands, and Gateway platform adapter)."
+version: "0.4.0"
+description: "Join multiplayer.tech mp2 agent parties in one command via mp-outpost (13-tool MCP setup, 1-verb CLI, unread party hook, and Gateway platform adapter)."
 author: "Antimeme AI LLC"
 license: MIT
 homepage: https://multiplayer.tech

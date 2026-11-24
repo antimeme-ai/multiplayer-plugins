@@ -2,9 +2,11 @@
  * Pi Coding Agent extension for multiplayer.tech (`mp-outpost`).
  *
  * Uses `execFile` exclusively (zero shell interpolation), refuses outbound secret
- * material (including zero-width/fullwidth/hyphen obfuscation) before spawning any
- * subprocess, sanitizes all peer metadata, and wraps every remote peer event kind
- * in per-response CSPRNG nonce fences matching `outpost-core/src/fence.rs`.
+ * material (including zero-width/fullwidth/hyphen obfuscation) and flag injection
+ * before spawning any subprocess, sanitizes all peer metadata, and wraps every
+ * remote peer event kind (including `chat_message`, `agent_card`, `control_notice`,
+ * `bridge_envelope`, and `membership_changed`) in per-response CSPRNG nonce fences
+ * matching `outpost-core/src/fence.rs`.
  */
 
 import { execFile } from "node:child_process";
@@ -179,6 +181,21 @@ export function detectForbiddenSecret(text: string): string | null {
   return null;
 }
 
+export function validateSafePositionalArg(label: string, raw: string): { value?: string; error?: string } {
+  const cleaned = raw.trim();
+  if (!cleaned) {
+    return { error: `Missing ${label}.` };
+  }
+  if (cleaned.startsWith("-")) {
+    return { error: `Refused ${label}: value cannot start with '-'.` };
+  }
+  const secretKind = detectForbiddenSecret(cleaned);
+  if (secretKind !== null) {
+    return { error: `Refused ${label}: detected forbidden secret material (${secretKind}).` };
+  }
+  return { value: cleaned };
+}
+
 export function sanitizePeerText(raw: string): string {
   let out = "";
   for (const ch of raw) {
@@ -226,33 +243,54 @@ export function fencePeerText(raw: string): string {
 }
 
 export interface OutpostPartyEvent {
-  event_seq: number;
+  event_seq?: number;
+  seq?: number;
   kind: string;
   sender_handle?: string;
+  from?: string;
   sender_account_id?: number;
   room_scope?: string;
-  body?: string;
+  body?: unknown;
+  card?: unknown;
   text?: string;
   payload_b64?: string;
   summary?: string;
 }
 
 export function formatPartyEvent(ev: OutpostPartyEvent): string {
+  const seq = Number.isSafeInteger(ev.event_seq)
+    ? ev.event_seq
+    : Number.isSafeInteger(ev.seq)
+      ? ev.seq
+      : 0;
   const kind = sanitizePeerText(String(ev.kind ?? "unknown"));
-  const handle = sanitizePeerText(String(ev.sender_handle ?? "system"));
+  const handle = sanitizePeerText(String(ev.sender_handle ?? ev.from ?? "system"));
   const accountId = Number.isSafeInteger(ev.sender_account_id) ? ev.sender_account_id : 0;
-  const header = `[seq=${ev.event_seq} kind=${kind} from=${handle}(${accountId})]`;
+  const header = `[seq=${seq} kind=${kind} from=${handle}(${accountId})]`;
 
   let payloadRaw: string;
-  if (ev.kind === "chat_message") {
+  if (ev.kind === "chat_message" || ev.kind === "chat") {
     payloadRaw = String(ev.body ?? "");
+  } else if (ev.kind === "agent_card") {
+    const scope = sanitizePeerText(String(ev.room_scope ?? ""));
+    const rawCard =
+      ev.body !== undefined && ev.body !== null
+        ? typeof ev.body === "string"
+          ? ev.body
+          : JSON.stringify(ev.body)
+        : ev.card !== undefined && ev.card !== null
+          ? typeof ev.card === "string"
+            ? ev.card
+            : JSON.stringify(ev.card)
+          : JSON.stringify(ev);
+    payloadRaw = scope ? `scope: ${scope}\n${rawCard}` : rawCard;
   } else if (ev.kind === "control_notice") {
     payloadRaw = String(ev.text ?? "");
   } else if (ev.kind === "bridge_envelope") {
     const scope = sanitizePeerText(String(ev.room_scope ?? ""));
     payloadRaw = `scope: ${scope}\npayload_b64: ${String(ev.payload_b64 ?? "")}`;
-  } else if (ev.kind === "membership_changed") {
-    payloadRaw = String(ev.summary ?? "");
+  } else if (ev.kind === "membership_changed" || ev.kind === "system") {
+    payloadRaw = String(ev.summary ?? ev.body ?? "");
   } else {
     payloadRaw = JSON.stringify(ev);
   }
@@ -304,7 +342,7 @@ export default function multiplayerExtension(pi: PiExtensionAPI): void {
   });
 
   pi.registerCommand("party-status", {
-    description: "Show local mp-outpost status and active party summary",
+    description: "Show local mp-outpost status and active mp2 party summary",
     async handler(_args, ctx) {
       try {
         const status = await runOutpostJson(["party", "status"]);
@@ -315,8 +353,106 @@ export default function multiplayerExtension(pi: PiExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("party-invite", {
+    description: "Create/reuse an mp2 party room and optionally ring @handle: /party-invite [@handle]",
+    async handler(rawArgs, ctx) {
+      const args = ["invite"];
+      if (rawArgs.trim()) {
+        const checked = validateSafePositionalArg("handle", rawArgs);
+        if (checked.error) {
+          ctx.notify(checked.error, "error");
+          return;
+        }
+        args.push(checked.value!);
+      }
+      try {
+        const resp = await runOutpostJson(args);
+        ctx.notify(JSON.stringify(resp, null, 2), "info");
+      } catch (err) {
+        ctx.notify(`mp-outpost invite failed: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("party-join", {
+    description: "Join by @handle, room code, share URL, or blank to accept latest invite: /party-join [target]",
+    async handler(rawArgs, ctx) {
+      const args = ["join"];
+      if (rawArgs.trim()) {
+        const checked = validateSafePositionalArg("target", rawArgs);
+        if (checked.error) {
+          ctx.notify(checked.error, "error");
+          return;
+        }
+        args.push(checked.value!);
+      }
+      try {
+        const resp = await runOutpostJson(args);
+        ctx.notify(JSON.stringify(resp, null, 2), "info");
+      } catch (err) {
+        ctx.notify(`mp-outpost join failed: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("party-leave", {
+    description: "Leave the active multiplayer.tech party room: /party-leave [party_id]",
+    async handler(rawArgs, ctx) {
+      const args = ["leave"];
+      if (rawArgs.trim()) {
+        const partyId = Number(rawArgs.trim());
+        if (!Number.isSafeInteger(partyId) || partyId <= 0) {
+          ctx.notify("Usage: /party-leave [party_id]", "warning");
+          return;
+        }
+        args.push(String(partyId));
+      }
+      try {
+        const resp = await runOutpostJson(args);
+        ctx.notify(JSON.stringify(resp, null, 2), "info");
+      } catch (err) {
+        ctx.notify(`mp-outpost leave failed: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("friend-add", {
+    description: "Send or accept a friend request by handle: /friend-add @handle",
+    async handler(rawArgs, ctx) {
+      const checked = validateSafePositionalArg("handle", rawArgs);
+      if (checked.error) {
+        ctx.notify(checked.error, "error");
+        return;
+      }
+      try {
+        const resp = await runOutpostJson(["add", checked.value!]);
+        ctx.notify(JSON.stringify(resp, null, 2), "info");
+      } catch (err) {
+        ctx.notify(`mp-outpost add failed: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("friends", {
+    description: "List multiplayer.tech friends, live presence, and pending invites",
+    async handler(_args, ctx) {
+      try {
+        const resp = await runOutpostJson(["friends"]).catch(async (err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.toLowerCase().includes("unknown subcommand")) {
+            return await runOutpostJson(["friend", "list"]);
+          }
+          throw err;
+        });
+        ctx.notify(JSON.stringify(resp, null, 2), "info");
+      } catch (err) {
+        ctx.notify(`mp-outpost friends failed: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
   pi.registerCommand("party", {
-    description: "List active multiplayer.tech party and recent messages",
+    description: "List active multiplayer.tech party and recent fenced messages",
     async handler(rawArgs, ctx) {
       try {
         const list = (await runOutpostJson(["party", "list"])) as {
@@ -352,7 +488,7 @@ export default function multiplayerExtension(pi: PiExtensionAPI): void {
   });
 
   pi.registerCommand("party-say", {
-    description: "Send an E2EE P2P chat message: /party-say <party_id> <message>",
+    description: "Send a chat message to the active mp2 party: /party-say <party_id> <message>",
     async handler(rawArgs, ctx) {
       const trimmed = rawArgs.trim();
       const splitIdx = trimmed.search(/\s+/);
