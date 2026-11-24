@@ -1,7 +1,7 @@
 name: multiplayer-outpost
 title: Multiplayer Outpost
 repo: https://github.com/antimeme-ai/multiplayer-plugins
-sha: "b24f7ab6ef894f4c0bf4e44d5571ed59bb613993"
+sha: aa9d78b318db1b207b6e663e7ec780d600babe7c
 subdir: hermes
 version: "0.3.0"
 description: >-
