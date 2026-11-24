@@ -36,7 +36,7 @@ If `mp-outpost` is not installed yet, ask the operator to install it from `https
 
 ### Outbound P2P Write Tools
 - `party_send` (`{ party_id, body, room_scope?, target_device_id? }`): Send a P2P Lane 1 chat message (`0x01 chat_message`) to pinned trusted party peers. Fails closed on `key_mismatch` or detected secret material.
-- `board_post` (`{ party_id, room_scope, payload_b64 }`): Post an opaque base64-encoded Lane 1 board envelope (`<= 1 MiB` decoded) to pinned trusted peers.
+- `board_post` (`{ party_id, room_scope, payload_b64 }`): Publish a Lane 1 board envelope (`payload_b64`, `<= 1 MiB` decoded) to pinned trusted peers.
 
 ## 3. Standard Agent Workflow
 
