@@ -318,19 +318,37 @@ class TestHermesTier1AndTier2(unittest.TestCase):
 
     def test_plugin_yaml_and_upstream_catalog_validity(self) -> None:
         plugin_yaml = yaml.safe_load((REPO_ROOT / "hermes" / "plugin.yaml").read_text(encoding="utf-8"))
-        self.assertEqual(plugin_yaml["manifest_version"], 1)
+        self.assertEqual(plugin_yaml["manifest_version"], 2)
         self.assertEqual(plugin_yaml["name"], "multiplayer-outpost")
         self.assertEqual(plugin_yaml["requires_env"], [])
-        self.assertIn("multiplayer", plugin_yaml["provides_platforms"])
-        self.assertIn("multiplayer", plugin_yaml["provides_cli"])
+        self.assertEqual(plugin_yaml["provides_hooks"], ["pre_llm_call"])
+        self.assertEqual(plugin_yaml["provides_tools"], [])
+        self.assertIn("linux", plugin_yaml["platforms"])
+        self.assertIn("macos", plugin_yaml["platforms"])
 
         catalog_path = (
             REPO_ROOT / "hermes" / "upstream" / "plugin-catalog" / "multiplayer-outpost.yaml"
         )
         catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
-        for key in ("name", "description", "repo", "sha", "tier", "category", "maintainer", "capabilities"):
+        for key in (
+            "name",
+            "title",
+            "description",
+            "repo",
+            "sha",
+            "subdir",
+            "version",
+            "tier",
+            "category",
+            "maintainer",
+            "requires_hermes",
+            "docs_url",
+            "platforms",
+            "capabilities",
+        ):
             self.assertIn(key, catalog)
         self.assertEqual(catalog["name"], "multiplayer-outpost")
+        self.assertEqual(catalog["subdir"], "hermes")
         self.assertEqual(catalog["tier"], "community")
         self.assertEqual(catalog["category"], "platform")
         sha_val = str(catalog["sha"])
@@ -340,8 +358,12 @@ class TestHermesTier1AndTier2(unittest.TestCase):
             f"unexpected sha format: {sha_val}",
         )
         caps = catalog["capabilities"]
-        for cap_key in ("mcp", "skills", "cli", "platforms"):
-            self.assertIn("multiplayer", caps[cap_key])
+        self.assertEqual(
+            set(caps.keys()),
+            {"provides_tools", "provides_hooks", "provides_middleware", "requires_env"},
+        )
+        self.assertEqual(caps["provides_hooks"], ["pre_llm_call"])
+        self.assertEqual(caps["requires_env"], [])
 
     def test_pi_adapter_secret_refusal_and_event_fencing(self) -> None:
         """Exercise adapters/pi/index.ts directly in Node to verify secret refusal & event fencing."""

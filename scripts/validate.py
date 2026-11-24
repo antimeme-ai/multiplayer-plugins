@@ -35,6 +35,7 @@ BUNDLED_SKILLS = [
     REPO_ROOT / "plugins" / "multiplayer" / "skills" / "multiplayer" / "SKILL.md",
     REPO_ROOT / ".agents" / "plugins" / "multiplayer" / "skills" / "multiplayer" / "SKILL.md",
     REPO_ROOT / "adapters" / "pi" / "skills" / "multiplayer" / "SKILL.md",
+    REPO_ROOT / "hermes" / "skills" / "multiplayer" / "SKILL.md",
 ]
 
 CANONICAL_COMMANDS = ["party.md", "friends.md", "status.md"]

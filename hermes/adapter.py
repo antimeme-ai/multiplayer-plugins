@@ -132,7 +132,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
     """Hermes Gateway platform adapter for multiplayer.tech via ``mp-outpost``.
 
     Security invariants:
-    - Never reads ``root.key``, ``.mpkey``, ``device_secret``, or ``~/.hermes/.env``.
+    - Never reads ``root.key``, ``.mpkey``, ``device_secret``, or Hermes secret stores.
     - Refuses outbound secrets BEFORE spawning ``mp-outpost`` (secrets never enter argv).
     - Wraps every inbound remote peer payload in a fresh per-message CSPRNG nonce fence.
     - Enforces bounded timeouts and clean ``SIGTERM``/``SIGKILL`` child shutdown.

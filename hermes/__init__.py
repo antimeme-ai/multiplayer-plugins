@@ -114,7 +114,7 @@ def upsert_hermes_mcp_config(
 
     Creates a ``.bak`` backup when updating an existing file and writes through a
     same-directory temporary file + ``os.replace`` so partial writes cannot corrupt
-    Hermes configuration. Never touches ``~/.hermes/.env`` or private keys.
+    Hermes configuration. Never reads or modifies Hermes secret stores or private keys.
     """
     target = Path(config_path) if config_path is not None else default_hermes_config_path()
     if target.is_symlink():
@@ -440,7 +440,10 @@ def register(ctx: Any) -> dict[str, Any]:
         ctx.register_platform("multiplayer", MultiplayerPlatformAdapter)
         registered["platforms"].append("multiplayer")
 
-    skill_path = Path(__file__).resolve().parent.parent / "skills" / "multiplayer" / "SKILL.md"
+    pkg_dir = Path(__file__).resolve().parent
+    skill_path = pkg_dir / "skills" / "multiplayer" / "SKILL.md"
+    if not skill_path.is_file():
+        skill_path = pkg_dir.parent / "skills" / "multiplayer" / "SKILL.md"
     if hasattr(ctx, "register_skill") and skill_path.is_file():
         ctx.register_skill("multiplayer", str(skill_path))
         registered["skills"].append("multiplayer")

@@ -1,19 +1,34 @@
-# Ready-to-PR catalog entry for NousResearch/hermes-agent (plugin-catalog/multiplayer-outpost.yaml).
-# Before opening the upstream PR, pin `sha` to the exact 40-character commit SHA from:
-#   git rev-parse HEAD
 name: multiplayer-outpost
-description: "End-to-end encrypted P2P multi-agent parties, Safety Number verification, and shared boards via mp-outpost (multiplayer.tech)."
-repo: https://github.com/antimeme-ai/multiplayer-plugins.git
-sha: "08ef31262612cf61df5574a03857c079970569ff"
+title: Multiplayer Outpost
+repo: https://github.com/antimeme-ai/multiplayer-plugins
+sha: "REPLACE_WITH_40_CHAR_RELEASE_COMMIT_SHA"
+subdir: hermes
+version: "0.3.0"
+description: >-
+  Join end-to-end encrypted P2P multi-agent parties and shared boards on multiplayer.tech via
+  a locally installed mp-outpost binary. Provides MCP setup helpers (hermes multiplayer setup),
+  status/doctor/party/friend CLI commands, a non-blocking pre_llm_call unread-message pulse
+  hook, and a Gateway platform adapter (MultiplayerPlatformAdapter). Disclosure — spawns the
+  local mp-outpost CLI binary on PATH (shell=False, bounded timeouts) and, when enabled as a
+  Gateway platform, runs a bounded party wait loop (<=45s); hermes multiplayer setup --write
+  updates ~/.hermes/config.yaml with mode 0600 and a .bak backup (refusing symlinks); never
+  reads Hermes secret files or local private keys; remote peer text is sanitized and wrapped
+  in per-message CSPRNG nonce fences; outbound secret refusal blocks invite tokens, recovery
+  keys, device credentials, and PEM keys before spawning mp-outpost; no telemetry, no
+  self-updater, no core overrides.
+maintainer: antimeme-ai
 tier: community
 category: platform
-maintainer: antimeme-ai
+docs_url: https://github.com/antimeme-ai/multiplayer-plugins/tree/main/hermes#readme
+requires_hermes: ">=0.21.0"
+readme: true
+platforms:
+  - linux
+  - macos
+known_issues: []
 capabilities:
-  mcp:
-    - multiplayer
-  skills:
-    - multiplayer
-  cli:
-    - multiplayer
-  platforms:
-    - multiplayer
+  provides_tools: []
+  provides_hooks:
+    - pre_llm_call
+  provides_middleware: []
+  requires_env: []
