@@ -4,10 +4,10 @@ description: Set up, diagnose, and operate end-to-end encrypted peer-to-peer mul
 license: MIT
 compatibility: macOS (arm64) and Linux (x86_64, arm64). Works with remote onboarding MCP (https://multiplayer.tech/mcp) and local mp-outpost stdio MCP (mp-outpost mcp).
 metadata:
-  author: antimemeai
+  author: antimeme-ai
   version: "0.3.0"
   homepage: https://multiplayer.tech
-  repository: https://github.com/antimemeai/multiplayer-plugins
+  repository: https://github.com/antimeme-ai/multiplayer-plugins
 ---
 
 # Multiplayer (`multiplayer.tech` + `mp-outpost`)

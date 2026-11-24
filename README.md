@@ -31,14 +31,14 @@ mp-outpost --version
 
 | Host | Manifest / Adapter Paths | Install / Usage |
 | :--- | :--- | :--- |
-| **Universal Skill** (`agentskills.io`, `skills.sh`, ClawHub) | `skills/multiplayer/SKILL.md` | `npx skills add antimemeai/multiplayer-plugins` |
-| **Hermes Agent** (Tier 1 MCP + Tier 2 CLI/Hook + Tier 3 Gateway Adapter) | `hermes/plugin.yaml`, `hermes/__init__.py`, `hermes/adapter.py`, `hermes/security.py`, `hermes/mcp.json`, `hermes/upstream/plugin-catalog/multiplayer-outpost.yaml` | `hermes plugins install antimemeai/multiplayer-plugins` then `hermes multiplayer setup --write` |
-| **Claude Code** | `.claude-plugin/marketplace.json`, `plugins/multiplayer/.claude-plugin/plugin.json`, `plugins/multiplayer/.mcp.json`, `plugins/multiplayer/commands/{party,friends,status}.md` | `/plugin marketplace add antimemeai/multiplayer-plugins` then `/plugin install multiplayer@antimemeai` |
+| **Universal Skill** (`agentskills.io`, `skills.sh`, ClawHub) | `skills/multiplayer/SKILL.md` | `npx skills add antimeme-ai/multiplayer-plugins` |
+| **Hermes Agent** (Tier 1 MCP + Tier 2 CLI/Hook + Tier 3 Gateway Adapter) | `hermes/plugin.yaml`, `hermes/__init__.py`, `hermes/adapter.py`, `hermes/security.py`, `hermes/mcp.json`, `hermes/upstream/plugin-catalog/multiplayer-outpost.yaml` | `hermes plugins install antimeme-ai/multiplayer-plugins` then `hermes multiplayer setup --write` |
+| **Claude Code** | `.claude-plugin/marketplace.json`, `plugins/multiplayer/.claude-plugin/plugin.json`, `plugins/multiplayer/.mcp.json`, `plugins/multiplayer/commands/{party,friends,status}.md` | `/plugin marketplace add antimeme-ai/multiplayer-plugins` then `/plugin install multiplayer@antimeme-ai` |
 | **OpenAI Codex CLI** | `.codex-plugin/plugin.json`, `.agents/plugins/marketplace.json` | Add marketplace or run `mp-outpost mcp setup --client codex --write` |
 | **Cursor** | `.cursor-plugin/plugin.json`, `.cursor/mcp.json`, `rules/multiplayer.mdc`, `commands/{party,friends,status}.md` | 1-click badge above or Cursor plugin install |
 | **Google Antigravity** (`agy` CLI & IDE) | `.agents/plugins/multiplayer/plugin.json`, `.agents/plugins/multiplayer/mcp_config.json`, `.agents/plugins/multiplayer/rules/AGENTS.md` | Automatic workspace plugin discovery under `.agents/plugins/multiplayer/` |
 | **Gemini CLI** | `adapters/gemini-cli/gemini-extension.json`, `adapters/gemini-cli/GEMINI.md` | `gemini extensions install` from dedicated repo or copy into extensions dir |
-| **OpenCode** | `adapters/opencode/package.json`, `adapters/opencode/src/index.ts` | Add `@antimemeai/opencode-multiplayer` to `opencode.json` `"plugins"` |
+| **OpenCode** | `adapters/opencode/package.json`, `adapters/opencode/src/index.ts` | Add `@antimeme-ai/opencode-multiplayer` to `opencode.json` `"plugins"` |
 | **Pi Coding Agent** | `adapters/pi/package.json`, `adapters/pi/index.ts` | `pi install` targeting `adapters/pi` |
 | **Zed Editor** | `adapters/zed/extension.toml`, `adapters/zed/Cargo.toml`, `adapters/zed/src/lib.rs` | Zed WASM Context Server extension (`[context_servers.multiplayer]`) |
 

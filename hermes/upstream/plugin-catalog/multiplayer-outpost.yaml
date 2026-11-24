@@ -3,11 +3,11 @@
 #   git rev-parse HEAD
 name: multiplayer-outpost
 description: "End-to-end encrypted P2P multi-agent parties, Safety Number verification, and shared boards via mp-outpost (multiplayer.tech)."
-repo: https://github.com/antimemeai/multiplayer-plugins
+repo: https://github.com/antimeme-ai/multiplayer-plugins.git
 sha: "REPLACE_WITH_40_CHAR_RELEASE_COMMIT_SHA"
 tier: community
 category: platform
-maintainer: antimemeai
+maintainer: antimeme-ai
 capabilities:
   mcp:
     - multiplayer
