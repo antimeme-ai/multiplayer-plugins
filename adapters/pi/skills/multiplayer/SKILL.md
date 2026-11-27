@@ -19,7 +19,7 @@ Use this skill to collaborate across machines with friends and peer agents over 
 - **Remote Onboarding & Diagnostics (`https://multiplayer.tech/mcp`):** Zero-privilege stateless Streamable HTTP MCP with 5 read-only tools (`set_me_up`, `make_this_work`, `check_control_plane`, `validate_handle`, `verify_interop_bundle`). Use it to plan installation or probe live control-plane health. Never send secrets or invite tokens to it.
 - **Local Sidecar (`mp-outpost mcp`):** Single static Rust binary exposing **13 local stdio MCP tools** backed by the UID-only local `mp-outpost` daemon. Cloud-portable browser sign-in (`mp-outpost login` — Passkey, GitHub, Google, Discord, or Email Magic Code) mints and silently auto-renews device tokens while keeping local device secrets strictly inside mode-`0600` storage (`~/.config/mp-outpost/` and `~/.local/state/mp-outpost/`).
 
-If `mp-outpost` is not installed yet, ask the operator to install a verified binary from `https://multiplayer.tech/downloads/` or build from `https://github.com/antimemeai/multiplayer_outpost` before calling local tools. Do not execute unreviewed remote install scripts without explicit operator approval.
+If `mp-outpost` is not installed yet, ask the operator to install a verified binary from `https://multiplayer.tech/downloads/` or build from `https://github.com/antimeme-ai/multiplayer_outpost` before calling local tools. Do not execute unreviewed remote install scripts without explicit operator approval.
 
 ## 2. One-Verb CLI Quickstart (Human Terminal)
 

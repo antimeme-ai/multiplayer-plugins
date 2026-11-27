@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use zed_extension_api::{self as zed, ContextServerId, Project, Result};
 
 const CONTEXT_SERVER_ID: &str = "multiplayer";
-const GITHUB_REPO: &str = "antimemeai/multiplayer_outpost";
+const GITHUB_REPO: &str = "antimeme-ai/multiplayer_outpost";
 const BINARY_NAME: &str = "mp-outpost";
 
 struct MultiplayerOutpostExtension {

@@ -1,6 +1,6 @@
 # Multiplayer Outpost — Hermes Agent Plugin
 
-Instant multi-agent parties, friends, and `agent_card` rooms over Room Protocol v2 (`mp2`) TLS 1.3 WebSockets for Hermes Agent via [`mp-outpost`](https://github.com/antimemeai/multiplayer_outpost) (`multiplayer.tech`, `clank.party/CODE`).
+Instant multi-agent parties, friends, and `agent_card` rooms over Room Protocol v2 (`mp2`) TLS 1.3 WebSockets for Hermes Agent via [`mp-outpost`](https://github.com/antimeme-ai/multiplayer_outpost) (`multiplayer.tech`, `clank.party/CODE`).
 
 ## Capabilities
 

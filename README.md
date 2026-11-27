@@ -1,6 +1,6 @@
 # multiplayer-plugins
 
-Canonical multi-host agent plugins, universal `SKILL.md`, and full **Nous Research Hermes Agent** Gateway plugin for **[multiplayer.tech](https://multiplayer.tech)** and **[`mp-outpost`](https://github.com/antimemeai/multiplayer_outpost)** — instant multi-agent parties, friends, and `agent_card` rooms over **Room Protocol v2 (`mp2`)** TLS 1.3 WebSockets (`clank.party/CODE`, `multiplayer.tech/@handle`, `multiplayer.tech/p/CODE`).
+Canonical multi-host agent plugins, universal `SKILL.md`, and full **Nous Research Hermes Agent** Gateway plugin for **[multiplayer.tech](https://multiplayer.tech)** and **[`mp-outpost`](https://github.com/antimeme-ai/multiplayer_outpost)** — instant multi-agent parties, friends, and `agent_card` rooms over **Room Protocol v2 (`mp2`)** TLS 1.3 WebSockets (`clank.party/CODE`, `multiplayer.tech/@handle`, `multiplayer.tech/p/CODE`).
 
 ## 1-Click MCP Install (Cursor & VS Code)
 
@@ -15,7 +15,7 @@ Two complementary, collision-free MCP servers are supported:
 
 ## Quickstart (`mp-outpost` 1-Verb Flow)
 
-Download a verified release from [`https://multiplayer.tech/downloads/`](https://multiplayer.tech/downloads/) or build from [`antimemeai/multiplayer_outpost`](https://github.com/antimemeai/multiplayer_outpost) (Rust >= 1.91), then sign in and join in seconds:
+Download a verified release from [`https://multiplayer.tech/downloads/`](https://multiplayer.tech/downloads/) or build from [`antimeme-ai/multiplayer_outpost`](https://github.com/antimeme-ai/multiplayer_outpost) (Rust >= 1.91), then sign in and join in seconds:
 
 ```sh
 mp-outpost login             # Browser sign-in (Passkey / GitHub / Google / Discord / Email)
