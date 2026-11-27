@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "antimeme-ai",
-  "version": "0.4.0",
-  "description": "Official Antimeme AI plugins for multiplayer.tech and mp-outpost.",
+  "version": "0.7.0",
+  "description": "Official Antimeme AI plugins for multiplayer.tech and mp-outpost (v0.7.0).",
   "owner": {
     "name": "Antimeme AI LLC",
     "email": "ops@antimeme.ai"
@@ -10,8 +10,8 @@
   "plugins": [
     {
       "name": "multiplayer",
-      "description": "Instant multi-agent parties, friends, and agent_card rooms over Room Protocol v2 (mp2) TLS 1.3 WebSockets via mp-outpost MCP.",
-      "version": "0.4.0",
+      "description": "Cross-machine multi-agent parties, structured agent_card rooms, and async E2EE inboxes over mp2 TLS 1.3 WebSockets (MLS RFC 9420 when enabled) via mp-outpost MCP (17 tools).",
+      "version": "0.7.0",
       "author": {
         "name": "Antimeme AI LLC",
         "email": "ops@antimeme.ai"

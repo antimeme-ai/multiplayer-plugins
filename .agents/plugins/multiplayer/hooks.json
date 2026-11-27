@@ -1,0 +1,16 @@
+{
+  "multiplayer-secret-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp_multiplayer_.*|.*multiplayer.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/secret_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Final
 
-from .security import SecretRefusalError, fence_peer_text, refuse_secrets, sanitize_peer_text
+from .security import (
+    SecretRefusalError,
+    fence_peer_text,
+    redact_url_fragments,
+    refuse_secrets,
+    sanitize_peer_text,
+    sanitize_single_line,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,8 +37,15 @@ class _StandaloneBasePlatformAdapter:
 
     platform_name: str = "multiplayer"
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
-        self.config: dict[str, Any] = dict(config or {})
+    def __init__(self, config: Any = None, platform: Any = None) -> None:
+        self.config: Any = dict(config) if isinstance(config, dict) else (config or {})
+        self.platform: Any = platform or "multiplayer"
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    async def disconnect(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
 
     async def start(self) -> None:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -38,27 +53,61 @@ class _StandaloneBasePlatformAdapter:
     async def stop(self) -> None:  # pragma: no cover - overridden
         raise NotImplementedError
 
-    async def send(self, target: str, text: str, **kwargs: Any) -> dict[str, Any]:  # pragma: no cover
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:  # pragma: no cover - overridden
         raise NotImplementedError
 
 
-def _resolve_base_adapter() -> type:
-    for mod_path in (
-        "hermes_agent.gateway.platforms.base",
-        "gateway.platforms.base",
-        "hermes.gateway.platforms.base",
-    ):
+def _resolve_hermes_gateway_types() -> tuple[type, Any, Any, Any, Any, bool]:
+    for prefix in ("hermes_agent.gateway", "gateway", "hermes.gateway"):
         try:
-            mod = __import__(mod_path, fromlist=["BasePlatformAdapter"])
-            base = getattr(mod, "BasePlatformAdapter", None)
-            if isinstance(base, type):
-                return base
+            base_mod = __import__(f"{prefix}.platforms.base", fromlist=["BasePlatformAdapter", "SendResult"])
+            base = getattr(base_mod, "BasePlatformAdapter", None)
+            send_result = getattr(base_mod, "SendResult", None)
+            if not isinstance(base, type):
+                continue
+            platform_enum = None
+            msg_event = None
+            msg_type = None
+            with contextlib.suppress(ImportError):
+                cfg_mod = __import__(f"{prefix}.config", fromlist=["Platform"])
+                platform_enum = getattr(cfg_mod, "Platform", None)
+            with contextlib.suppress(ImportError):
+                ev_mod = __import__(f"{prefix}.platforms.event", fromlist=["MessageEvent", "MessageType"])
+                msg_event = getattr(ev_mod, "MessageEvent", None)
+                msg_type = getattr(ev_mod, "MessageType", None)
+            return base, send_result, platform_enum, msg_event, msg_type, True
         except ImportError:
             continue
-    return _StandaloneBasePlatformAdapter
+    return _StandaloneBasePlatformAdapter, None, None, None, None, False
 
 
-BasePlatformAdapter: type = _resolve_base_adapter()
+(
+    BasePlatformAdapter,
+    _HermesSendResult,
+    _HermesPlatform,
+    _HermesMessageEvent,
+    _HermesMessageType,
+    _HAS_HERMES_BASE,
+) = _resolve_hermes_gateway_types()
+
+
+def _coerce_hermes_platform(platform: Any) -> Any:
+    if platform is None:
+        platform = "multiplayer"
+    if _HermesPlatform is not None and isinstance(platform, str):
+        try:
+            return _HermesPlatform(platform)
+        except (ValueError, TypeError):
+            # Platform may not be registered yet during isolated standalone tests.
+            return platform
+    return platform
 
 
 class OutpostError(RuntimeError):
@@ -87,6 +136,9 @@ class PeerProvenance:
     room_scope: str = ""
     party_epoch: int = 0
     untrusted_remote: bool = True
+    is_browser: bool = False
+    sender_client: str = ""
+    is_historical_catchup: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,23 +190,40 @@ def _validate_safe_cli_token(value: str, field_name: str) -> str:
     return cleaned
 
 
+def _extract_cfg_dict(config: Any) -> dict[str, Any]:
+    if isinstance(config, dict):
+        return dict(config)
+    extra = getattr(config, "extra", None)
+    if isinstance(extra, dict):
+        return dict(extra)
+    return {}
+
+
 class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
     """Hermes Gateway platform adapter for multiplayer.tech via ``mp-outpost``.
+
+    Implements both Hermes ``BasePlatformAdapter`` lifecycle methods
+    (``connect`` / ``disconnect`` / ``send``) and standalone helpers
+    (``start`` / ``stop`` / ``send_message``).
 
     Security invariants:
     - Never reads ``root.key``, ``.mpkey``, ``device_secret``, or Hermes secret stores.
     - Refuses outbound secrets BEFORE spawning ``mp-outpost`` (secrets never enter argv).
-    - Wraps every inbound remote peer payload (including ``chat_message``, ``agent_card``,
-      ``control_notice``, ``bridge_envelope``, and ``membership_changed``) in a fresh
-      per-message CSPRNG nonce fence.
+    - Redacts ``#fragment`` invite secrets in error messages and logs.
+    - Marks ``is_browser=True`` / ``sender_client in ("web", "browser")`` events as
+      always untrusted remote input even under the local operator's own handle.
+    - Wraps every inbound remote peer payload in a fresh per-message CSPRNG nonce fence.
     - Enforces bounded timeouts and clean ``SIGTERM``/``SIGKILL`` child shutdown.
     """
 
     platform_name: str = "multiplayer"
+    name: str = "multiplayer"
+    MAX_MESSAGE_LENGTH: int = 8192
 
     def __init__(
         self,
-        config: dict[str, Any] | None = None,
+        config: Any = None,
+        platform: Any = None,
         *,
         binary: str | None = None,
         party_id: int | None = None,
@@ -166,8 +235,14 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         max_consecutive_errors: int = 5,
         backoff_s: float = 0.25,
     ) -> None:
-        super().__init__(config or {})
-        cfg = config or {}
+        cfg = _extract_cfg_dict(config)
+        self._hermes_native_mode = _HAS_HERMES_BASE and platform is not None
+        coerced_platform = _coerce_hermes_platform(platform)
+        if _HAS_HERMES_BASE:
+            super().__init__(config if config is not None else cfg, coerced_platform)
+        else:
+            super().__init__(cfg, coerced_platform)
+        self._own_device_id: int = 0
         self.binary: str = binary or str(cfg.get("binary", "mp-outpost"))
         raw_party = party_id if party_id is not None else cfg.get("party_id")
         self.party_id: int | None = int(raw_party) if raw_party is not None else None
@@ -221,18 +296,21 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         sub_args: list[str],
         *,
         timeout_s: float,
+        stdin_bytes: bytes | None = None,
     ) -> dict[str, Any]:
         argv = self._base_argv() + sub_args
         proc = await asyncio.create_subprocess_exec(
             *argv,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         self._active_procs.add(proc)
         try:
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(input=stdin_bytes), timeout=timeout_s
+                )
             except asyncio.TimeoutError as exc:
                 await self._terminate_proc(proc)
                 raise OutpostTimeoutError(
@@ -245,7 +323,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
             self._active_procs.discard(proc)
 
         stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
-        stderr_text = stderr_b.decode("utf-8", errors="replace").strip()
+        stderr_text = redact_url_fragments(stderr_b.decode("utf-8", errors="replace").strip())
 
         if not stdout_text:
             if proc.returncode in (0, None):
@@ -255,8 +333,9 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
 
         if proc.returncode != 0:
+            safe_out = redact_url_fragments(stdout_text[:200])
             raise OutpostError(
-                f"mp-outpost exited with code {proc.returncode}: {stderr_text[:200] or stdout_text[:200]}"
+                f"mp-outpost exited with code {proc.returncode}: {stderr_text[:200] or safe_out}"
             )
 
         try:
@@ -312,7 +391,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         *,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        """Join an mp2 party by @handle, room code, share URL, or accept latest invite when target is None."""
+        """Join an mp2 party by #fragment invite URL, @handle, room code, or accept latest invite."""
         args = ["join"]
         if target is not None and target.strip():
             args.append(_validate_safe_cli_token(target, "target"))
@@ -355,36 +434,187 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         args.append(body)
         return await self._run_json(args, timeout_s=self.subprocess_grace_s)
 
-    async def send(self, target: str, text: str, **kwargs: Any) -> dict[str, Any]:
-        """BasePlatformAdapter-compatible send method (`target` is party_id string)."""
-        party_id = int(target)
-        room_scope = str(kwargs.get("room_scope", "party/main"))
-        target_device_id = kwargs.get("target_device_id")
-        return await self.send_message(
-            party_id,
-            text,
-            room_scope=room_scope,
-            target_device_id=int(target_device_id) if target_device_id is not None else None,
+    async def post_card(
+        self,
+        party_id: int,
+        title: str,
+        summary: str,
+        *,
+        status: str | None = None,
+        diff_stat: str | None = None,
+        files: list[str] | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Post a structured `agent_card` (<=2048 B JSON) via `board post --payload-stdin`."""
+        pid = _validate_safe_id(party_id, "party_id")
+        clean_title = title.strip()
+        clean_summary = summary.strip()
+        if not clean_title or not clean_summary:
+            raise ValueError("title and summary must be non-empty")
+        refuse_secrets(clean_title)
+        refuse_secrets(clean_summary)
+        card: dict[str, Any] = {"title": clean_title, "summary": clean_summary}
+        if status is not None:
+            if status not in ("done", "working", "testing", "blocked", "error"):
+                raise ValueError("status must be one of done|working|testing|blocked|error")
+            card["status"] = status
+        if diff_stat and diff_stat.strip():
+            refuse_secrets(diff_stat)
+            card["diff_stat"] = diff_stat.strip()
+        if agent_name and agent_name.strip():
+            refuse_secrets(agent_name)
+            card["agent_name"] = agent_name.strip()
+        if files:
+            if len(files) > 16:
+                raise ValueError("files exceeds max count of 16")
+            for f in files:
+                refuse_secrets(f)
+            card["files"] = list(files)
+        encoded = json.dumps(card, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > 2048:
+            raise ValueError(f"agent_card JSON exceeds 2048 bytes ({len(encoded)} bytes)")
+        return await self._run_json(
+            ["board", "post", str(pid), "--scope", "party/main", "--payload-stdin"],
+            timeout_s=self.subprocess_grace_s,
+            stdin_bytes=encoded,
         )
+
+    async def inbox_send(
+        self,
+        recipient: str,
+        body: str,
+        *,
+        ttl_secs: int | None = None,
+    ) -> dict[str, Any]:
+        """Send an async E2EE dead-drop inbox message via stdin (zero secret on argv)."""
+        clean_recipient = _validate_safe_cli_token(recipient, "recipient")
+        if not isinstance(body, str) or not body:
+            raise ValueError("body must be a non-empty string")
+        refuse_secrets(body)
+        args = ["inbox", "send", clean_recipient, "--stdin"]
+        if ttl_secs is not None:
+            ttl = int(ttl_secs)
+            if ttl < 300 or ttl > 604_800:
+                raise ValueError("ttl_secs must be in 300..=604800")
+            args.extend(["--ttl-secs", str(ttl)])
+        return await self._run_json(
+            args,
+            timeout_s=self.subprocess_grace_s,
+            stdin_bytes=body.encode("utf-8"),
+        )
+
+    async def inbox_read(self, *, ack: bool = False) -> dict[str, Any]:
+        """Fetch and locally decrypt pending E2EE dead-drop inbox messages, fencing bodies."""
+        args = ["inbox", "read"]
+        if ack:
+            args.append("--ack")
+        resp = await self._run_json(args, timeout_s=self.subprocess_grace_s)
+        drops = resp.get("drops")
+        if isinstance(drops, list):
+            fenced_drops: list[dict[str, Any]] = []
+            for drop in drops:
+                if not isinstance(drop, dict):
+                    continue
+                body = str(drop.get("body", ""))
+                fenced_body, nonce = fence_peer_text(body)
+                item = dict(drop)
+                item["sender_handle"] = sanitize_peer_text(str(drop.get("sender_handle", "")))
+                item["fenced_body"] = fenced_body
+                item["nonce"] = nonce
+                item["untrusted_remote"] = True
+                item.pop("body", None)
+                fenced_drops.append(item)
+            resp = dict(resp)
+            resp["drops"] = fenced_drops
+        return resp
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """BasePlatformAdapter-compatible send method (`chat_id` is party_id string)."""
+        _ = reply_to
+        meta = metadata or {}
+        party_id = int(chat_id)
+        room_scope = str(kwargs.get("room_scope", meta.get("room_scope", "party/main")))
+        target_device_id = kwargs.get("target_device_id", meta.get("target_device_id"))
+        try:
+            result = await self.send_message(
+                party_id,
+                content,
+                room_scope=room_scope,
+                target_device_id=int(target_device_id) if target_device_id is not None else None,
+            )
+            delivered_to = result.get("delivered_to")
+            withheld = result.get("withheld_unpinned") or []
+            disconnected = result.get("disconnected") or []
+            undelivered = (
+                isinstance(delivered_to, list)
+                and len(delivered_to) == 0
+                and (len(withheld) > 0 or len(disconnected) > 0)
+            )
+            if self._hermes_native_mode and _HermesSendResult is not None:
+                if undelivered:
+                    return _HermesSendResult(
+                        success=False,
+                        error=(
+                            f"message not delivered (withheld_unpinned={len(withheld)}, "
+                            f"disconnected={len(disconnected)})"
+                        ),
+                        raw_response=result,
+                    )
+                return _HermesSendResult(
+                    success=True,
+                    message_id=str(result.get("client_msg_id") or result.get("event_seq") or ""),
+                    raw_response=result,
+                )
+            return result
+        except Exception as exc:
+            if self._hermes_native_mode and _HermesSendResult is not None:
+                return _HermesSendResult(success=False, error=redact_url_fragments(str(exc)))
+            raise
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        """Hermes BasePlatformAdapter abstract method implementation."""
+        return {"name": f"multiplayer/party/{chat_id}", "type": "group"}
 
     @staticmethod
     def format_inbound_event(party_id: int, raw_event: dict[str, Any]) -> FencedPeerMessage:
         """Convert a raw mp-outpost JSON event into a provenance-fenced message."""
         kind = str(raw_event.get("kind", "unknown"))
         event_seq = int(raw_event.get("event_seq", raw_event.get("seq", 0)))
+        sender_client = sanitize_peer_text(
+            str(raw_event.get("sender_client", raw_event.get("client", "")))
+        )
+        is_browser = bool(raw_event.get("is_browser", False)) or sender_client.strip().lower() in (
+            "web",
+            "browser",
+        )
+        is_historical_catchup = bool(raw_event.get("is_historical_catchup", False))
+        # Browser-originated messages are ALWAYS untrusted remote input even under own handle.
+        untrusted_remote = (
+            True
+            if is_browser
+            else bool(raw_event.get("untrusted_remote", kind not in ("membership_changed", "system")))
+        )
         provenance = PeerProvenance(
             party_id=party_id,
             event_seq=event_seq,
             kind=kind,
             sender_account_id=int(raw_event.get("sender_account_id", 0)),
             sender_device_id=int(raw_event.get("sender_device_id", 0)),
-            sender_handle=sanitize_peer_text(str(raw_event.get("sender_handle", raw_event.get("from", "")))),
-            safety_number=sanitize_peer_text(str(raw_event.get("safety_number", ""))),
-            room_scope=sanitize_peer_text(str(raw_event.get("room_scope", ""))),
+            sender_handle=sanitize_single_line(str(raw_event.get("sender_handle", raw_event.get("from", "")))),
+            safety_number=sanitize_single_line(str(raw_event.get("safety_number", ""))),
+            room_scope=sanitize_single_line(str(raw_event.get("room_scope", ""))),
             party_epoch=int(raw_event.get("party_epoch", 0)),
-            untrusted_remote=bool(
-                raw_event.get("untrusted_remote", kind not in ("membership_changed", "system"))
-            ),
+            untrusted_remote=untrusted_remote,
+            is_browser=is_browser,
+            sender_client=sender_client,
+            is_historical_catchup=is_historical_catchup,
         )
 
         if kind in ("chat_message", "chat"):
@@ -406,7 +636,26 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         elif kind == "control_notice":
             payload_raw = str(raw_event.get("text", ""))
         elif kind == "bridge_envelope":
-            payload_raw = f"scope: {provenance.room_scope}\npayload_b64: {raw_event.get('payload_b64', '')}"
+            raw_b64 = str(raw_event.get("payload_b64", ""))
+            card_rendered: str | None = None
+            if raw_b64:
+                with contextlib.suppress(Exception):
+                    decoded = base64.b64decode(raw_b64, validate=True).decode("utf-8")
+                    parsed_card = json.loads(decoded)
+                    if (
+                        isinstance(parsed_card, dict)
+                        and isinstance(parsed_card.get("title"), str)
+                        and isinstance(parsed_card.get("summary"), str)
+                    ):
+                        card_rendered = json.dumps(parsed_card, sort_keys=True)
+            if card_rendered is not None:
+                payload_raw = (
+                    f"scope: {provenance.room_scope}\nagent_card: {card_rendered}"
+                    if provenance.room_scope
+                    else f"agent_card: {card_rendered}"
+                )
+            else:
+                payload_raw = f"scope: {provenance.room_scope}\npayload_b64: {raw_b64}"
         elif kind in ("membership_changed", "system"):
             payload_raw = str(raw_event.get("summary") or raw_event.get("body") or "")
         else:
@@ -490,11 +739,49 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return fenced_messages, resp
 
     async def _dispatch_message(self, msg: FencedPeerMessage) -> None:
-        if self.on_message is None:
+        # Filter own-device echoes so gateway sessions never loop on their own sends.
+        if (
+            self._own_device_id > 0
+            and msg.provenance.sender_device_id == self._own_device_id
+        ):
             return
-        result = self.on_message(msg)
-        if asyncio.iscoroutine(result):
-            await result
+        if self.on_message is not None:
+            result = self.on_message(msg)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        if (
+            self._hermes_native_mode
+            and _HermesMessageEvent is not None
+            and _HermesMessageType is not None
+            and getattr(self, "_message_handler", None) is not None
+        ):
+            origin = " origin=browser" if msg.provenance.is_browser else ""
+            meta = (
+                f"[party={msg.provenance.party_id} seq={msg.provenance.event_seq} "
+                f"kind={msg.provenance.kind} from={msg.provenance.sender_handle}"
+                f"({msg.provenance.sender_account_id}){origin}]"
+            )
+            source = self.build_source(
+                chat_id=str(msg.provenance.party_id),
+                chat_name=f"Party #{msg.provenance.party_id}",
+                chat_type="group",
+                user_id=str(msg.provenance.sender_account_id or msg.provenance.sender_device_id),
+                user_name=msg.provenance.sender_handle or "peer",
+            )
+            event = _HermesMessageEvent(
+                text=f"{meta}\n{msg.fenced_body}",
+                message_type=_HermesMessageType.TEXT,
+                source=source,
+                raw_message={
+                    "party_id": msg.provenance.party_id,
+                    "event_seq": msg.provenance.event_seq,
+                    "kind": msg.provenance.kind,
+                    "is_browser": msg.provenance.is_browser,
+                },
+                message_id=f"mp-{msg.provenance.party_id}-{msg.provenance.event_seq}",
+            )
+            await self.handle_message(event)
 
     async def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -530,6 +817,29 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._stop_event.wait(), timeout=delay_s)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Hermes BasePlatformAdapter connect entry point."""
+        _ = is_reconnect
+        with contextlib.suppress(Exception):
+            st = await self.status()
+            dev_id = st.get("device_id")
+            if isinstance(dev_id, int) and dev_id > 0:
+                self._own_device_id = dev_id
+        await self.start()
+        if hasattr(self, "_mark_connected"):
+            self._mark_connected()
+        else:
+            self._running = True
+        return True
+
+    async def disconnect(self) -> None:
+        """Hermes BasePlatformAdapter disconnect entry point."""
+        await self.stop()
+        if hasattr(self, "_mark_disconnected"):
+            self._mark_disconnected()
+        else:
+            self._running = False
 
     async def start(self) -> None:
         """Start the background party_wait polling loop."""

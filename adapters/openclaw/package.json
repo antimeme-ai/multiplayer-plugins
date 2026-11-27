@@ -1,0 +1,30 @@
+{
+  "name": "@antimeme-ai/multiplayer",
+  "version": "0.7.0",
+  "description": "OpenClaw plugin connecting agents to multiplayer.tech mp2 parties (MLS RFC 9420 when enabled) and async E2EE inboxes via local mp-outpost.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "openclaw.plugin.json",
+    "index.ts",
+    "src/",
+    "skills/",
+    "README.md"
+  ],
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antimeme-ai/multiplayer-plugins",
+    "directory": "adapters/openclaw"
+  },
+  "homepage": "https://multiplayer.tech",
+  "peerDependencies": {
+    "openclaw": "*"
+  }
+}

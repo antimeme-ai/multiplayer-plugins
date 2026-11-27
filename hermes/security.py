@@ -1,4 +1,4 @@
-"""Provenance fencing and outbound secret refusal matching mp-outpost core."""
+"""Provenance fencing, URL fragment redaction, and outbound secret refusal matching mp-outpost v0.7.0."""
 
 from __future__ import annotations
 
@@ -19,16 +19,20 @@ _PARTY_INVITE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:^|[^A-Za-z0-9])mppi1_[0-9]+_[A-Za-z0-9_-]{43,}",
     re.IGNORECASE,
 )
+_SESSION_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:mpcs1_|mpguest1_)[A-Za-z0-9_-]{16,}",
+    re.IGNORECASE,
+)
 _DEVICE_LINK_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:^|[^A-Za-z0-9])mpdl1_[A-Za-z0-9_-]{43,}",
     re.IGNORECASE,
 )
 _PEM_PRIVATE_RE: Final[re.Pattern[str]] = re.compile(
-    r"-----BEGIN [A-Za-z0-9 -]{0,48}(?:PRIVATE|RECOVERY|SECRET) KEY-----",
+    r"-----(?:BEGIN|END) [A-Z0-9 -]{0,48}(?:PRIVATE|RECOVERY|SECRET) KEY-----",
     re.IGNORECASE,
 )
 _MPKEY_RE: Final[re.Pattern[str]] = re.compile(
-    r'(?:"format"\s*:\s*"mpkey"|MPKEY1|"kdf"\s*:\s*"argon2id"[\s\S]{0,256}"ciphertext")',
+    r'(?:"format"\s*:\s*"mpkey"|MPKEY1|TVBLRVkxAA|"kdf"\s*:\s*"argon2id"[\s\S]{0,256}"ciphertext")',
     re.IGNORECASE,
 )
 _DEVICE_CRED_RE: Final[re.Pattern[str]] = re.compile(
@@ -36,6 +40,20 @@ _DEVICE_CRED_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 _ANGLE_RUN_RE: Final[re.Pattern[str]] = re.compile(r"<{3,}|>{3,}")
+_URL_FRAGMENT_RE: Final[re.Pattern[str]] = re.compile(
+    r"((?:https?://)?(?:clank\.party|multiplayer\.tech|mp\.gg)/[^\s#\"']+?)#[A-Za-z0-9_-]+",
+    re.IGNORECASE,
+)
+
+# Secret regexes for Hermes `ctx.register_redaction_patterns(...)` (each starts with >=2 literal chars).
+REDACTION_PATTERNS: Final[tuple[str, ...]] = (
+    r"mpinv1_[A-Za-z0-9_-]{20,}",
+    r"mppi1_[0-9]+_[A-Za-z0-9_-]{20,}",
+    r"mpdl1_[A-Za-z0-9_-]{20,}",
+    r"mprk1_[A-Za-z0-9_-]{20,}",
+    r"mpcs1_[A-Za-z0-9_-]{16,}",
+    r"mpguest1_[A-Za-z0-9_-]{16,}",
+)
 
 _CROCKFORD_MAP: Final[dict[str, int]] = {
     "0": 0, "O": 0, "o": 0,
@@ -63,6 +81,11 @@ class SecretRefusalError(ValueError):
         super().__init__(f"outbound payload refused: detected forbidden secret material ({kind})")
 
 
+def redact_url_fragments(text: str) -> str:
+    """Redact `#fragment` invite secrets on multiplayer.tech / clank.party / mp.gg URLs."""
+    return _URL_FRAGMENT_RE.sub(r"\1#[REDACTED]", text)
+
+
 def sanitize_peer_text(raw: str) -> str:
     """Strip C0 (except \\n and \\t), DEL, C1, Unicode separators, BiDi, zero-width, and Tag chars."""
     out: list[str] = []
@@ -84,6 +107,11 @@ def sanitize_peer_text(raw: str) -> str:
             continue
         out.append(ch)
     return "".join(out)
+
+
+def sanitize_single_line(raw: str) -> str:
+    """Sanitize metadata values (handles, scopes) to a single line with no CR/LF/tabs."""
+    return " ".join(sanitize_peer_text(raw).replace("\n", " ").replace("\t", " ").split())
 
 
 def break_angle_runs(text: str) -> str:
@@ -131,7 +159,6 @@ def _normalize_recovery_chars(text: str) -> str:
 def _verify_unprefixed_recovery_window(syms: list[int]) -> bool:
     if len(syms) != 55:
         return False
-    # Canonical 55th symbol has 3 trailing unused padding bits == 0.
     if (syms[-1] & 0x07) != 0:
         return False
     if len(set(syms)) <= 1:
@@ -157,7 +184,6 @@ def _contains_recovery_key(text: str) -> bool:
     norm = _normalize_recovery_chars(text)
     lower = norm.lower()
 
-    # 1. Prefixed mprk1_ recovery key scan (mirrors outpost-core PrefixedRecoveryScan).
     start = 0
     while True:
         idx = lower.find("mprk1_", start)
@@ -181,15 +207,12 @@ def _contains_recovery_key(text: str) -> bool:
             else:
                 break
 
-    # 2. Unprefixed 55-symbol Crockford Base32 recovery key with SHA-256 checksum.
-    # Collect contiguous runs of Crockford symbols and allowed separators.
     n = len(norm)
     i = 0
     while i < n:
         if norm[i] not in _CROCKFORD_MAP:
             i += 1
             continue
-        # Only start at a non-Crockford boundary.
         if i > 0 and norm[i - 1] in _CROCKFORD_MAP:
             i += 1
             continue
@@ -214,7 +237,6 @@ def _contains_recovery_key(text: str) -> bool:
         if syms:
             v, p, sb, _ = syms[-1]
             syms[-1] = (v, p, sb, True)
-        # Slide 55-symbol window across token boundaries within this run.
         if len(syms) >= 55:
             for k in range(0, len(syms) - 54):
                 first = syms[k]
@@ -237,14 +259,15 @@ def detect_secret_kind(payload: str | bytes) -> str | None:
     """Return the matched secret kind if payload contains forbidden secret material.
 
     Checks both raw text and zero-width/fullwidth/dash-normalized text so obfuscated
-    tokens (e.g., ``mpinv1_\\u200b...`` or fullwidth PEM headers) cannot bypass refusal.
+    tokens (e.g., ``mpinv1_\\u200b...``, ``mpcs1_...``, ``mpguest1_...``, or fullwidth PEM
+    headers) cannot bypass refusal.
     """
     text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else payload
     norm = _normalize_recovery_chars(text)
     candidates = (text, norm) if norm != text else (text,)
 
     for candidate in candidates:
-        if _INVITE_RE.search(candidate) or _PARTY_INVITE_RE.search(candidate):
+        if _INVITE_RE.search(candidate) or _PARTY_INVITE_RE.search(candidate) or _SESSION_TOKEN_RE.search(candidate):
             return "invite_token"
         if _DEVICE_LINK_RE.search(candidate):
             return "device_link_token"

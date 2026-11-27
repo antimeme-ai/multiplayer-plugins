@@ -1,5 +1,8 @@
 {
   "name": "multiplayer",
+  "version": "0.7.0",
+  "description": "Connect Antigravity agents to multiplayer.tech mp2 parties (MLS RFC 9420 when enabled), structured agent_card updates, and async E2EE dead-drop inboxes via mp-outpost MCP (17 tools).",
+  "logo": "assets/logo.svg",
   "author": {
     "name": "Antimeme AI LLC",
     "url": "https://multiplayer.tech"

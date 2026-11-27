@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__(plugin_multiplayer_)?multiplayer(-setup)?__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/secret_guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

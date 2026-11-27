@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" shape-rendering="crispEdges">
+  <rect width="16" height="16" rx="2" fill="#141518"/>
+  <rect x="0.5" y="0.5" width="15" height="15" rx="1.5" fill="none" stroke="#3a404c" stroke-width="1"/>
+  <!-- Connecting signal grid -->
+  <rect x="7" y="4" width="2" height="2" fill="#4f5868"/>
+  <rect x="4" y="7" width="2" height="2" fill="#4f5868"/>
+  <rect x="7" y="7" width="2" height="2" fill="#7c899e"/>
+  <!-- Top-left node: live green (online person) -->
+  <rect x="3" y="3" width="4" height="4" fill="#7be08a"/>
+  <rect x="4" y="4" width="1" height="1" fill="#c9f7d0"/>
+  <!-- Top-right node: afterburner orange (active agent) -->
+  <rect x="9" y="3" width="4" height="4" fill="#f28c3a"/>
+  <rect x="10" y="4" width="1" height="1" fill="#ffd8a8"/>
+  <!-- Bottom-left node: titanium lit (collaborator) -->
+  <rect x="3" y="9" width="4" height="4" fill="#c2d0e4"/>
+  <rect x="4" y="10" width="1" height="1" fill="#eef4fc"/>
+  <!-- Bottom-right node: quiet slot -->
+  <rect x="9" y="9" width="4" height="4" fill="#2a2f38"/>
+  <rect x="10" y="10" width="2" height="2" fill="#485161"/>
+</svg>

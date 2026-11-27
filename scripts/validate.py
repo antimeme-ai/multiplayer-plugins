@@ -4,11 +4,13 @@
 Validates:
 1. Strict JSON (including duplicate-key rejection), YAML, and TOML syntax across all repo files.
 2. Zero symlinks and zero '..' path escapes; every relative path referenced by manifests exists.
-3. Canonical SKILL.md (`agentskills.io` frontmatter) and command parity across all host bundles.
-4. Hermes plugin.yaml and upstream plugin-catalog schema validity (including `requires_env: []`).
+3. Canonical SKILL.md (`agentskills.io` frontmatter, all 17 tools) and command parity (9 commands)
+   across all host bundles (Claude Code, Antigravity, Pi, OpenClaw, Hermes).
+4. Hermes plugin.yaml, OpenClaw openclaw.plugin.json, Claude Code hooks/icon, Antigravity hooks/logo,
+   OpenCode TUI safety (zero console.*), Pi extension, and Zed extension checks.
 5. Verified GitHub-safe 1-click Cursor and VS Code install badges in README.md (round-trip decoded).
 6. Zero hardcoded secrets or personal absolute paths across repository files.
-7. Full `tests/test_hermes_plugin.py` unittest suite pass.
+7. Full `tests/` unittest suite pass (Hermes, OpenClaw, OpenCode, Pi, Claude Code & Antigravity hooks).
 """
 
 from __future__ import annotations
@@ -35,10 +37,42 @@ BUNDLED_SKILLS = [
     REPO_ROOT / "plugins" / "multiplayer" / "skills" / "multiplayer" / "SKILL.md",
     REPO_ROOT / ".agents" / "plugins" / "multiplayer" / "skills" / "multiplayer" / "SKILL.md",
     REPO_ROOT / "adapters" / "pi" / "skills" / "multiplayer" / "SKILL.md",
+    REPO_ROOT / "adapters" / "openclaw" / "skills" / "multiplayer" / "SKILL.md",
     REPO_ROOT / "hermes" / "skills" / "multiplayer" / "SKILL.md",
 ]
 
-CANONICAL_COMMANDS = ["party.md", "friends.md", "status.md", "invite.md", "join.md", "leave.md", "add.md"]
+CANONICAL_COMMANDS = [
+    "party.md",
+    "friends.md",
+    "status.md",
+    "invite.md",
+    "join.md",
+    "leave.md",
+    "add.md",
+    "card.md",
+    "inbox.md",
+    "chat.md",
+]
+
+ALL_MCP_TOOLS = (
+    "outpost_status",
+    "party_list",
+    "party_members",
+    "party_friends",
+    "party_invite",
+    "party_join",
+    "party_leave",
+    "friend_add",
+    "party_send",
+    "party_post_card",
+    "board_post",
+    "party_poll",
+    "board_read",
+    "party_wait",
+    "inbox_send",
+    "inbox_read",
+    "inbox_ack",
+)
 
 PERSONAL_PATH_RE = re.compile(r"(?:/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+|C:\\\\Users\\\\[A-Za-z0-9._-]+)")
 LIVE_SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -147,9 +181,13 @@ def _validate_manifest_references(errors: list[str]) -> None:
     cc_plugin_path = REPO_ROOT / "plugins" / "multiplayer" / ".claude-plugin" / "plugin.json"
     cc_plugin = _load_json_strict(cc_plugin_path)
     cc_plugin_root = cc_plugin_path.parent.parent
-    for key in ("skills", "commands", "mcpServers"):
+    for key in ("skills", "commands", "mcpServers", "hooks", "icon"):
         if key in cc_plugin:
             _check_rel_path(cc_plugin_root, cc_plugin[key], cc_plugin_path, errors)
+    if not cc_plugin.get("privacyPolicyUrl"):
+        errors.append("plugins/multiplayer/.claude-plugin/plugin.json: missing privacyPolicyUrl")
+    _check_rel_path(cc_plugin_root, "scripts/secret_guard.py", cc_plugin_path, errors)
+    _check_rel_path(cc_plugin_root, "README.md", cc_plugin_path, errors)
 
     # 2. Codex CLI plugin + marketplace
     codex_plugin_path = REPO_ROOT / ".codex-plugin" / "plugin.json"
@@ -174,7 +212,19 @@ def _validate_manifest_references(errors: list[str]) -> None:
 
     # 4. Antigravity plugin
     agy_root = REPO_ROOT / ".agents" / "plugins" / "multiplayer"
-    for required in ("plugin.json", "mcp_config.json", "rules/AGENTS.md", "skills/multiplayer/SKILL.md"):
+    agy_manifest = _load_json_strict(agy_root / "plugin.json")
+    if not agy_manifest.get("version"):
+        errors.append(".agents/plugins/multiplayer/plugin.json: missing version")
+    if agy_manifest.get("logo"):
+        _check_rel_path(agy_root, agy_manifest["logo"], agy_root / "plugin.json", errors)
+    for required in (
+        "plugin.json",
+        "mcp_config.json",
+        "hooks.json",
+        "scripts/secret_guard.py",
+        "rules/AGENTS.md",
+        "skills/multiplayer/SKILL.md",
+    ):
         _check_rel_path(agy_root, required, agy_root / "plugin.json", errors)
 
     # 5. Gemini CLI adapter
@@ -200,7 +250,25 @@ def _validate_manifest_references(errors: list[str]) -> None:
         for rel in pi_block.get(group, []):
             _check_rel_path(pi_pkg_path.parent, rel, pi_pkg_path, errors)
 
-    # 8. Zed adapter
+    # 8. OpenClaw adapter
+    oc_root = REPO_ROOT / "adapters" / "openclaw"
+    oc_manifest_path = oc_root / "openclaw.plugin.json"
+    oc_manifest = _load_json_strict(oc_manifest_path)
+    if not oc_manifest.get("id"):
+        errors.append("adapters/openclaw/openclaw.plugin.json: missing required 'id'")
+    if not isinstance(oc_manifest.get("configSchema"), dict):
+        errors.append("adapters/openclaw/openclaw.plugin.json: missing required inline 'configSchema'")
+    for rel in oc_manifest.get("skills", []):
+        _check_rel_path(oc_root, rel, oc_manifest_path, errors)
+    oc_pkg_path = oc_root / "package.json"
+    oc_pkg = _load_json_strict(oc_pkg_path)
+    oc_exts = oc_pkg.get("openclaw", {}).get("extensions", [])
+    if not oc_exts:
+        errors.append("adapters/openclaw/package.json: missing openclaw.extensions entries")
+    for rel in oc_exts:
+        _check_rel_path(oc_root, rel, oc_pkg_path, errors)
+
+    # 9. Zed adapter
     zed_ext_path = REPO_ROOT / "adapters" / "zed" / "extension.toml"
     zed_ext = tomllib.loads(zed_ext_path.read_text(encoding="utf-8"))
     ext_id = str(zed_ext.get("id", ""))
@@ -234,21 +302,7 @@ def _validate_skill_and_parity(errors: list[str]) -> None:
             errors.append("SKILL.md compatibility must be <= 500 chars")
 
     skill_text = CANONICAL_SKILL.read_text(encoding="utf-8")
-    for tool in (
-        "outpost_status",
-        "party_list",
-        "party_members",
-        "party_friends",
-        "party_invite",
-        "party_join",
-        "party_leave",
-        "friend_add",
-        "party_send",
-        "board_post",
-        "party_poll",
-        "board_read",
-        "party_wait",
-    ):
+    for tool in ALL_MCP_TOOLS:
         if tool not in skill_text:
             errors.append(f"skills/multiplayer/SKILL.md: missing tool reference '{tool}'")
 

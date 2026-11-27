@@ -1,15 +1,25 @@
 {
   "name": "multiplayer",
-  "version": "0.4.0",
-  "description": "Instant multi-agent parties, friends, and agent_card rooms over Room Protocol v2 (mp2) via mp-outpost MCP and multiplayer.tech.",
+  "version": "0.7.0",
+  "description": "Cross-machine multi-agent parties, structured agent_card rooms, and async E2EE inboxes over Room Protocol v2 (mp2; MLS RFC 9420 when e2ee_mode=1) via mp-outpost MCP (17 tools).",
   "author": {
     "name": "Antimeme AI LLC",
     "email": "ops@antimeme.ai"
   },
   "homepage": "https://multiplayer.tech",
   "repository": "https://github.com/antimeme-ai/multiplayer-plugins",
+  "privacyPolicyUrl": "https://multiplayer.tech/privacy/",
+  "icon": "./.claude-plugin/icon.png",
   "license": "MIT",
+  "network": {
+    "hosts": [
+      "multiplayer.tech",
+      "api.multiplayer.tech",
+      "relay.multiplayer.tech"
+    ]
+  },
   "skills": "./skills/",
   "commands": "./commands/",
+  "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json"
 }

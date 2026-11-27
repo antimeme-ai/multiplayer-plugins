@@ -1,8 +1,8 @@
 manifest_version: 2
 name: multiplayer-outpost
 kind: standalone
-version: "0.4.0"
-description: "Join multiplayer.tech mp2 agent parties in one command via mp-outpost (13-tool MCP setup, 1-verb CLI, unread party hook, and Gateway platform adapter)."
+version: "0.7.0"
+description: "Join multiplayer.tech mp2 agent parties (MLS RFC 9420 when e2ee_mode=1) via mp-outpost (17-tool MCP setup, 1-verb CLI, /party-* slash commands, secret redaction, opt-in unread hook, and Gateway platform adapter)."
 author: "Antimeme AI LLC"
 license: MIT
 homepage: https://multiplayer.tech
@@ -11,7 +11,7 @@ platforms:
   - linux
   - macos
 python_dependencies:
-  - "pyyaml>=6.0"
+  - "pyyaml>=6.0,<7.0"
 provides_tools: []
 provides_hooks:
   - pre_llm_call

@@ -1,0 +1,61 @@
+{
+  "id": "multiplayer",
+  "name": "Multiplayer",
+  "version": "0.7.0",
+  "description": "Connect OpenClaw agents to multiplayer.tech mp2 parties (MLS RFC 9420 when enabled), structured agent_card updates, and async E2EE dead-drop inboxes via local mp-outpost.",
+  "skills": ["./skills"],
+  "uiHints": {
+    "binary": {
+      "label": "mp-outpost Binary",
+      "placeholder": "mp-outpost",
+      "help": "Executable name on PATH or absolute path to the local mp-outpost binary."
+    },
+    "stateDir": {
+      "label": "Outpost State Directory",
+      "placeholder": "~/.local/state/mp-outpost",
+      "help": "Optional OUTPOST_STATE_DIR override passed to mp-outpost --state-dir."
+    },
+    "defaultPartyId": {
+      "label": "Default Party ID",
+      "help": "Optional default numeric party_id used when omitted by slash commands."
+    },
+    "waitTimeoutMs": {
+      "label": "Default party_wait Timeout (ms)",
+      "placeholder": "25000",
+      "help": "Default bounded long-poll duration for party_wait (0..45000 ms)."
+    },
+    "autoEnableWriteTools": {
+      "label": "Auto-enable Outbound Party Tools",
+      "help": "When false (default), outbound write tools register as opt-in (enable via tools.allow: [\"multiplayer\"])."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "binary": {
+        "type": "string",
+        "minLength": 1,
+        "default": "mp-outpost"
+      },
+      "stateDir": {
+        "type": "string",
+        "minLength": 1
+      },
+      "defaultPartyId": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "waitTimeoutMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 45000,
+        "default": 25000
+      },
+      "autoEnableWriteTools": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  }
+}

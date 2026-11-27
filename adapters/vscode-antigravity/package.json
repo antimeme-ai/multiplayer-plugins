@@ -1,0 +1,59 @@
+{
+  "name": "multiplayer-party-chat",
+  "displayName": "Multiplayer Party Chat",
+  "description": "One-click Status Bar button and Command Palette actions to open mp-outpost party chat natively inside Antigravity IDE / VS Code or in a detached phux window.",
+  "version": "0.7.0",
+  "publisher": "antimeme-ai",
+  "license": "MIT",
+  "homepage": "https://multiplayer.tech",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antimeme-ai/multiplayer-plugins"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "multiplayer.openPartyChat",
+        "title": "Multiplayer: Open Party Chat (Integrated Terminal)",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "multiplayer.openDetachedPhuxChat",
+        "title": "Multiplayer: Open Party Chat (Detached phux Window)",
+        "icon": "$(window)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "multiplayer.openPartyChat",
+        "key": "ctrl+alt+m",
+        "mac": "cmd+alt+m"
+      }
+    ],
+    "configuration": {
+      "title": "Multiplayer Party Chat",
+      "properties": {
+        "multiplayer.outpostBinary": {
+          "type": "string",
+          "default": "mp-outpost",
+          "description": "Path or command name for the local mp-outpost binary."
+        },
+        "multiplayer.phuxSession": {
+          "type": "string",
+          "default": "multiplayer-chat",
+          "description": "Detached phux/tmux session name used by Open Party Chat (Detached phux Window)."
+        }
+      }
+    }
+  }
+}
