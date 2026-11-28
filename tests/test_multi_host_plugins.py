@@ -683,6 +683,123 @@ class TestMultiHostPlugins(unittest.TestCase):
             self.assertNotIn(secret_tok, proc.stdout)
             self.assertNotIn(synth_rk, proc.stdout)
 
+        # 3. Antigravity hook decimal-string ID coercion (prevents 15-digit scientific-notation replay truncation)
+        lazy_coerce_in = json.dumps(
+            {
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": "multiplayer_multiplayer",
+                        "ToolName": "party_poll",
+                        "Arguments": {
+                            "party_id": "2162678961511450",
+                            "cursor_epoch": "1679057306706682",
+                            "after_seq": "74",
+                            "limit": 10,
+                        },
+                    },
+                }
+            }
+        )
+        proc = subprocess.run(
+            [sys.executable, str(agy_hook)],
+            input=lazy_coerce_in,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["decision"], "ask")
+        self.assertEqual(
+            out["overwrite"],
+            {
+                "Arguments": {
+                    "party_id": 2162678961511450,
+                    "cursor_epoch": 1679057306706682,
+                    "after_seq": 74,
+                    "limit": 10,
+                }
+            },
+        )
+
+        # Eager tool call coerces drop_ids list elements without touching non-ID keys
+        eager_coerce_in = json.dumps(
+            {
+                "toolCall": {
+                    "name": "mcp_multiplayer_inbox_ack",
+                    "args": {"drop_ids": ["1679057306706682", 42]},
+                }
+            }
+        )
+        proc = subprocess.run(
+            [sys.executable, str(agy_hook)],
+            input=eager_coerce_in,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out, {"decision": "ask", "overwrite": {"drop_ids": [1679057306706682, 42]}})
+
+        # Out-of-range (> MAX_SAFE_INTEGER) or non-decimal strings are NOT coerced, and integer calls omit overwrite
+        for no_overwrite_args in (
+            {"party_id": 2162678961511450, "cursor_epoch": 1679057306706682, "after_seq": 74},
+            {"party_id": "9007199254740992", "after_seq": 0},
+            {"party_id": "not-a-number", "after_seq": 0},
+        ):
+            raw_no_ow = json.dumps(
+                {
+                    "toolCall": {
+                        "name": "call_mcp_tool",
+                        "args": {
+                            "ServerName": "multiplayer_multiplayer",
+                            "ToolName": "party_poll",
+                            "Arguments": no_overwrite_args,
+                        },
+                    }
+                }
+            )
+            proc = subprocess.run(
+                [sys.executable, str(agy_hook)],
+                input=raw_no_ow,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertEqual(json.loads(proc.stdout), {"decision": "ask"})
+
+        # Secret alongside stringified IDs still fails closed (no overwrite bypass)
+        secret_with_str_id = json.dumps(
+            {
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": "multiplayer_multiplayer",
+                        "ToolName": "party_send",
+                        "Arguments": {"party_id": "2162678961511450", "body": f"leak {secret_tok}"},
+                    },
+                }
+            }
+        )
+        proc = subprocess.run(
+            [sys.executable, str(agy_hook)],
+            input=secret_with_str_id,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["decision"], "deny")
+        self.assertNotIn("overwrite", out)
+
     def test_hermes_cli_entrypoint_shared_read_cursor_and_json_safe_redaction(self) -> None:
         # 1. Non-greedy URL fragment redaction preserves surrounding JSON quotes
         raw_json = '{"share_url":"https://multiplayer.tech/p/i/42#SECRET999","ok":true}'

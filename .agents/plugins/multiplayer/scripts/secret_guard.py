@@ -22,7 +22,11 @@ RECOVERY_KEY_DOMAIN_SEP = b"mp-recovery-v1:"
 MAX_RECOVERY_WINDOW_TOKENS = 16
 MAX_RECOVERY_WINDOW_SPAN = 160
 MAX_SCAN_DEPTH = 8
+MAX_SAFE_INTEGER = 9007199254740991
 RECOVERY_SEPS = frozenset("-_.,/:| \t\r\n\f\v")
+DECIMAL_ID_RE = re.compile(r"^[0-9]{1,16}$")
+SAFE_INT_SCALAR_KEYS = frozenset({"party_id", "cursor_epoch", "target_device_id", "after_seq"})
+SAFE_INT_LIST_KEYS = frozenset({"drop_ids"})
 
 CROCKFORD_MAP = {
     "0": 0, "O": 0, "o": 0,
@@ -226,6 +230,57 @@ def scan_value(
     return None
 
 
+def _parse_safe_int_str(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not DECIMAL_ID_RE.fullmatch(stripped):
+        return None
+    parsed = int(stripped)
+    if 0 <= parsed <= MAX_SAFE_INTEGER:
+        return parsed
+    return None
+
+
+def _coerce_safe_int_fields(args_obj: Any) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Coerce decimal-string 53-bit IDs to exact ints for mp-outpost MCP tools.
+
+    Antigravity replays historical numeric tool arguments using 15-digit float
+    formatting (`1.679...e+15`), which can drop the 16th digit of `party_id` or
+    `cursor_epoch`. Allowing callers to pass exact decimal strings preserves all
+    16 digits in conversation history while delivering exact JSON integers to
+    `mp-outpost` via PreToolUse `overwrite`.
+
+    Returns `(full_coerced_dict, changed_keys_dict)` if any field was coerced,
+    otherwise `None`.
+    """
+    if not isinstance(args_obj, dict):
+        return None
+    changed: dict[str, Any] = {}
+    for key, val in args_obj.items():
+        if key in SAFE_INT_SCALAR_KEYS:
+            parsed = _parse_safe_int_str(val)
+            if parsed is not None:
+                changed[key] = parsed
+        elif key in SAFE_INT_LIST_KEYS and isinstance(val, list):
+            new_list: list[Any] = []
+            list_changed = False
+            for item in val:
+                parsed = _parse_safe_int_str(item)
+                if parsed is not None:
+                    new_list.append(parsed)
+                    list_changed = True
+                else:
+                    new_list.append(item)
+            if list_changed:
+                changed[key] = new_list
+    if not changed:
+        return None
+    full = dict(args_obj)
+    full.update(changed)
+    return full, changed
+
+
 def _deny(reason: str) -> int:
     print(json.dumps({"decision": "deny", "reason": reason}))
     return 0
@@ -246,8 +301,10 @@ def main() -> int:
         args = tool_call.get("args")
         effective_tool_name = tool_name
         scan_target: Any = args
+        is_lazy_mcp = tool_name in ("call_mcp_tool", "mcp_tool")
+        lazy_args_key: str | None = None
         # Antigravity loads plugin MCP tools lazily via `call_mcp_tool(ServerName, ToolName, Arguments)`.
-        if tool_name in ("call_mcp_tool", "mcp_tool"):
+        if is_lazy_mcp:
             if not isinstance(args, dict):
                 return _deny("Refused MCP tool call: malformed call_mcp_tool args (fail closed).")
             server_name = str(args.get("ServerName") or args.get("serverName") or args.get("server_name") or "")
@@ -256,12 +313,28 @@ def main() -> int:
                 print('{"decision": "ask"}')
                 return 0
             effective_tool_name = str(args.get("ToolName") or args.get("toolName") or args.get("tool_name") or "")
-            scan_target = args.get("Arguments") if "Arguments" in args else args.get("arguments", args)
+            if "Arguments" in args:
+                lazy_args_key = "Arguments"
+                scan_target = args.get("Arguments")
+            elif "arguments" in args:
+                lazy_args_key = "arguments"
+                scan_target = args.get("arguments")
+            else:
+                scan_target = args
         secret_kind = scan_value(scan_target, tool_name=effective_tool_name)
         if secret_kind is not None:
             return _deny(
                 f"Refused outbound multiplayer tool call: detected forbidden secret material ({secret_kind})."
             )
+        coerced = _coerce_safe_int_fields(scan_target)
+        if coerced is not None:
+            full_coerced, changed_only = coerced
+            if is_lazy_mcp and lazy_args_key is not None:
+                print(json.dumps({"decision": "ask", "overwrite": {lazy_args_key: full_coerced}}))
+                return 0
+            if not is_lazy_mcp:
+                print(json.dumps({"decision": "ask", "overwrite": changed_only}))
+                return 0
         # Defer to Antigravity's normal permission policy (respects Always Allow
         # cache without auto-approving write tools).
         print('{"decision": "ask"}')
