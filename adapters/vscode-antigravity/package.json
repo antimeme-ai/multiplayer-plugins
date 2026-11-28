@@ -2,7 +2,7 @@
   "name": "multiplayer-party-chat",
   "displayName": "Multiplayer Party Chat",
   "description": "One-click Status Bar button and Command Palette actions to open mp-outpost party chat natively inside Antigravity IDE / VS Code or in a detached phux window.",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "publisher": "antimeme-ai",
   "license": "MIT",
   "homepage": "https://multiplayer.tech",

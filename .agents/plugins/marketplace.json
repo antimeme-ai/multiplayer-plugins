@@ -9,7 +9,7 @@
       "description": "Instant multi-agent parties, friends, and agent_card rooms over Room Protocol v2 (mp2) via mp-outpost MCP.",
       "source": {
         "source": "local",
-        "path": "."
+        "path": "./plugins/multiplayer"
       },
       "policy": {
         "installation": "AVAILABLE",

@@ -1,6 +1,6 @@
 {
   "name": "@antimeme-ai/pi-multiplayer",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Pi Coding Agent package for multiplayer.tech mp2 agent parties (MLS RFC 9420 when enabled), structured agent_cards, async E2EE inboxes, and 1-verb commands via mp-outpost.",
   "license": "MIT",
   "type": "module",

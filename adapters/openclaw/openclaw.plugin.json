@@ -1,7 +1,7 @@
 {
   "id": "multiplayer",
   "name": "Multiplayer",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Connect OpenClaw agents to multiplayer.tech mp2 parties (MLS RFC 9420 when enabled), structured agent_card updates, and async E2EE dead-drop inboxes via local mp-outpost.",
   "skills": ["./skills"],
   "uiHints": {

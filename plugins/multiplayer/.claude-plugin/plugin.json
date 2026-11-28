@@ -1,6 +1,6 @@
 {
   "name": "multiplayer",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Cross-machine multi-agent parties, structured agent_card rooms, opt-in listener profiles, and async E2EE inboxes over Room Protocol v2 (mp2; MLS RFC 9420 when e2ee_mode=1) via mp-outpost MCP (18 tools).",
   "author": {
     "name": "Antimeme AI LLC",

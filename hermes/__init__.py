@@ -54,7 +54,7 @@ from .security import (
 )
 
 PLUGIN_NAME: Final[str] = "multiplayer-outpost"
-PLUGIN_VERSION: Final[str] = "0.7.0"
+PLUGIN_VERSION: Final[str] = "0.7.1"
 DEFAULT_HERMES_MCP_TIMEOUT_S: Final[int] = 90
 DEFAULT_HERMES_CONNECT_TIMEOUT_S: Final[int] = 30
 MIN_PARTY_WAIT_TOOL_TIMEOUT_S: Final[int] = 60

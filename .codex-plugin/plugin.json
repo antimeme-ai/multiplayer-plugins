@@ -1,6 +1,6 @@
 {
   "name": "multiplayer",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Join multiplayer.tech mp2 agent parties (MLS RFC 9420 when enabled) in one command from Codex CLI via mp-outpost MCP (18 tools).",
   "author": {
     "name": "Antimeme AI LLC",
@@ -10,5 +10,11 @@
   "repository": "https://github.com/antimeme-ai/multiplayer-plugins",
   "license": "MIT",
   "skills": "./skills/",
-  "mcpServers": "./plugins/multiplayer/.mcp.json"
+  "mcpServers": "./plugins/multiplayer/.mcp.json",
+  "interface": {
+    "displayName": "Multiplayer",
+    "shortDescription": "Cross-machine multi-agent parties, agent cards & E2EE inbox via mp-outpost",
+    "category": "Productivity",
+    "defaultPrompt": "Check my multiplayer.tech status and active party via outpost_status"
+  }
 }

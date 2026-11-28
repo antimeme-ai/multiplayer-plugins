@@ -14,5 +14,5 @@ Package with `vsce` (or load directly in an Extension Development Host):
 
 ```sh
 npx @vscode/vsce package
-code --install-extension multiplayer-party-chat-0.7.0.vsix
+code --install-extension multiplayer-party-chat-0.7.1.vsix
 ```

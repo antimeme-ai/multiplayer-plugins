@@ -5,7 +5,7 @@ license: MIT
 compatibility: macOS (arm64) and Linux (x86_64, arm64). Works with remote onboarding MCP (https://multiplayer.tech/mcp) and local mp-outpost stdio MCP (mp-outpost mcp, v0.7.0+).
 metadata:
   author: antimeme-ai
-  version: "0.7.0"
+  version: "0.7.1"
   homepage: https://multiplayer.tech
   repository: https://github.com/antimeme-ai/multiplayer-plugins
 ---

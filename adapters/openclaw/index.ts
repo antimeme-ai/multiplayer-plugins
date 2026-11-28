@@ -884,7 +884,7 @@ export function buildAgentTools(
 const plugin = {
   id: "multiplayer",
   name: "Multiplayer",
-  version: "0.7.0",
+  version: "0.7.1",
   description:
     "Connect OpenClaw agents to multiplayer.tech mp2 parties (MLS RFC 9420 when enabled) and async E2EE inboxes via local mp-outpost.",
   register(api: OpenClawPluginApi): void {

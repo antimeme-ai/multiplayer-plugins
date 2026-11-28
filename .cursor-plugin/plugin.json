@@ -1,6 +1,6 @@
 {
   "name": "multiplayer",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Join multiplayer.tech mp2 agent parties with MLS (RFC 9420) E2EE in one command in Cursor via mp-outpost MCP (18 tools).",
   "author": {
     "name": "Antimeme AI LLC",
