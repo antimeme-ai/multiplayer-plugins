@@ -6,17 +6,27 @@ Zero external dependencies (Python 3 stdlib only). Refuses secret tokens and
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
+import weakref
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from .security import SecretRefusalError, refuse_secrets
+from .security import (
+    SecretRefusalError,
+    redact_url_fragments,
+    refuse_secrets,
+    sanitize_peer_text,
+    sanitize_single_line,
+)
 
 DEFAULT_SESSION_NAME = "multiplayer-chat"
+MAX_SAFE_PARTY_ID = (1 << 53) - 1
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SAFE_TARGET_RE = re.compile(r"^@?[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -344,8 +354,405 @@ def run_chat_in_place(
     return _run()
 
 
+def _default_inline_emit(line: str) -> None:
+    """Print a sanitized inline party line cleanly above the Hermes prompt."""
+    try:
+        from prompt_toolkit.application import get_app_or_none, run_in_terminal
+
+        if get_app_or_none() is not None:
+            run_in_terminal(lambda: print(line, flush=True))
+            return
+    except Exception:
+        pass
+    print(line, flush=True)
+
+
+def _extract_event_body(raw_event: dict[str, Any]) -> str:
+    for key in ("text", "body", "message"):
+        val = raw_event.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    payload = raw_event.get("payload")
+    if isinstance(payload, str) and payload.strip():
+        return payload
+    if isinstance(payload, dict):
+        if payload.get("type") == "agent_card" or "title" in payload:
+            title = str(payload.get("title", "")).strip()
+            summary = str(payload.get("summary", "")).strip()
+            status = str(payload.get("status", "")).strip()
+            tag = f"[{status}] " if status else ""
+            if title and summary:
+                return f"card: {tag}{title} — {summary}"
+            if title or summary:
+                return f"card: {tag}{title or summary}"
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return ""
+
+
+class InlinePartyWatcher:
+    """Zero-token background inline party feed for interactive Hermes sessions.
+
+    Streams sanitized incoming messages directly above the Hermes prompt via
+    bounded `mp-outpost --json party wait` loops without triggering LLM turns.
+    """
+
+    def __init__(
+        self,
+        *,
+        outpost_binary: str = "mp-outpost",
+        state_dir: str | None = None,
+        wait_timeout_ms: int = 25_000,
+        emit_fn: Callable[[str], None] | None = None,
+        popen_factory: Any = None,
+        run_factory: Any = None,
+        idle_backoff_s: float = 2.0,
+    ) -> None:
+        self.outpost_binary = outpost_binary
+        self.state_dir = state_dir
+        self.wait_timeout_ms = max(1_000, min(int(wait_timeout_ms), 45_000))
+        self._emit_fn = emit_fn or _default_inline_emit
+        self._popen = popen_factory or subprocess.Popen
+        self._run = run_factory or subprocess.run
+        self._idle_backoff_s = max(0.05, float(idle_backoff_s))
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._proc: Any = None
+        self._atexit_registered = False
+
+        self.party_id: int | None = None
+        self._pinned_party: bool = False
+        self.after_seq: int = 0
+        self.daemon_epoch: int = 0
+        self.self_device_id: int = 0
+        self.received_count: int = 0
+        self.last_error: str | None = None
+
+    def _base_argv(self) -> list[str]:
+        argv = [_resolve_binary_path(self.outpost_binary)]
+        if self.state_dir:
+            argv.extend(["--state-dir", self.state_dir])
+        argv.append("--json")
+        return argv
+
+    def _run_json(self, sub_args: list[str], timeout_s: float = 5.0) -> tuple[dict[str, Any] | None, str]:
+        try:
+            proc = self._run(
+                self._base_argv() + sub_args,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, redact_url_fragments(str(exc))
+        if proc.returncode != 0 or not (proc.stdout or "").strip():
+            return None, redact_url_fragments((proc.stderr or proc.stdout or "").strip())
+        try:
+            parsed = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return None, "invalid json from mp-outpost"
+        return (parsed if isinstance(parsed, dict) else None), ""
+
+    def _discover_party(self, preferred_party_id: int | None = None) -> tuple[int | None, int, int, str]:
+        listed, err = self._run_json(["party", "list"], timeout_s=5.0)
+        if not listed:
+            return None, 0, 0, err or "failed to query mp-outpost party list"
+        parties = listed.get("parties") or []
+        if not parties:
+            return None, 0, 0, "No active multiplayer party found. Join or open one first with /party-join or /party-invite."
+        chosen = None
+        if preferred_party_id is not None:
+            chosen = next(
+                (p for p in parties if isinstance(p, dict) and int(p.get("party_id", 0) or 0) == preferred_party_id),
+                None,
+            )
+            if chosen is None:
+                return None, 0, 0, f"Party #{preferred_party_id} is not active."
+        if chosen is None:
+            chosen = parties[0]
+        pid = int(chosen["party_id"])
+        raw_next = chosen.get("next_seq")
+        seed_seq = int(raw_next) if isinstance(raw_next, int) and raw_next > 0 else 0
+        epoch = int(listed.get("daemon_epoch", chosen.get("daemon_epoch", 0)) or 0)
+        return pid, seed_seq, epoch, ""
+
+    def _refresh_self_device(self) -> None:
+        st, _ = self._run_json(["party", "status"], timeout_s=3.0)
+        if st:
+            dev_id = st.get("device_id")
+            if isinstance(dev_id, int) and dev_id > 0:
+                self.self_device_id = dev_id
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
+
+    def _terminate_active_proc(self) -> None:
+        with self._lock:
+            proc = self._proc
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+
+    def start(self, target: str | None = None) -> dict[str, Any]:
+        """Start streaming live incoming party messages inline above the prompt."""
+        requested_pid: int | None = None
+        if target is not None and target.strip():
+            cleaned = target.strip()
+            if cleaned.startswith("-") or "#" in cleaned:
+                raise ValueError("inline party target must be a positive numeric party_id")
+            refuse_secrets(cleaned)
+            try:
+                requested_pid = int(cleaned)
+            except ValueError as exc:
+                raise ValueError("Usage: /party-chat --inline [on|off|status|<party_id>]") from exc
+            if requested_pid < 1 or requested_pid > MAX_SAFE_PARTY_ID:
+                raise ValueError(f"party_id must be in 1..={MAX_SAFE_PARTY_ID}")
+
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
+            if running and (requested_pid is None or requested_pid == self.party_id):
+                return {
+                    "ok": True,
+                    "running": True,
+                    "already_running": True,
+                    "party_id": self.party_id,
+                    "after_seq": self.after_seq,
+                    "message": (
+                        f"Inline party feed already running for party #{self.party_id} "
+                        f"(seq={self.after_seq}). Reply with /party-say <msg> or stop with /party-chat --inline off."
+                    ),
+                }
+
+        if self.is_running:
+            self.stop()
+
+        pid, seed_seq, epoch, err = self._discover_party(requested_pid)
+        if pid is None:
+            return {"ok": False, "running": False, "party_id": None, "message": err}
+
+        self._refresh_self_device()
+        with self._lock:
+            self.party_id = pid
+            self._pinned_party = requested_pid is not None
+            self.after_seq = seed_seq
+            self.daemon_epoch = epoch
+            self.last_error = None
+            self._stop_event.clear()
+            thread = threading.Thread(
+                target=self._watch_loop,
+                name="hermes-multiplayer-inline",
+                daemon=True,
+            )
+            self._thread = thread
+            if not self._atexit_registered:
+                weak_self = weakref.ref(self)
+
+                def _cleanup() -> None:
+                    inst = weak_self()
+                    if inst is not None:
+                        inst.stop()
+
+                atexit.register(_cleanup)
+                self._atexit_registered = True
+            thread.start()
+
+        return {
+            "ok": True,
+            "running": True,
+            "already_running": False,
+            "party_id": pid,
+            "after_seq": seed_seq,
+            "message": (
+                f"Inline party feed started for party #{pid} (live from seq={seed_seq}, zero LLM tokens). "
+                "Reply with /party-say <message>; stop with /party-chat --inline off."
+            ),
+        }
+
+    def stop(self) -> dict[str, Any]:
+        """Stop the inline party feed and terminate any in-flight party wait child."""
+        with self._lock:
+            was_running = self._thread is not None and self._thread.is_alive()
+            self._stop_event.set()
+            thread = self._thread
+        self._terminate_active_proc()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        with self._lock:
+            self._thread = None
+            self._proc = None
+        return {
+            "ok": True,
+            "running": False,
+            "was_running": was_running,
+            "message": (
+                "Stopped inline party feed."
+                if was_running
+                else "Inline party feed is not running."
+            ),
+        }
+
+    def status(self) -> dict[str, Any]:
+        running = self.is_running
+        if running:
+            msg = (
+                f"Inline party feed: ON (party #{self.party_id}, seq={self.after_seq}, "
+                f"received={self.received_count}). Reply with /party-say <message> or stop with /party-chat --inline off."
+            )
+        else:
+            msg = "Inline party feed: OFF. Start with /party-chat --inline."
+        return {
+            "running": running,
+            "party_id": self.party_id,
+            "after_seq": self.after_seq,
+            "received_count": self.received_count,
+            "last_error": self.last_error,
+            "message": msg,
+        }
+
+    def _watch_loop(self) -> None:
+        while not self._stop_event.is_set():
+            pid = self.party_id
+            if pid is None:
+                discovered_pid, seed_seq, epoch, err = self._discover_party(None)
+                if discovered_pid is None:
+                    self.last_error = err
+                    self._stop_event.wait(self._idle_backoff_s)
+                    continue
+                self.party_id = discovered_pid
+                self.after_seq = seed_seq
+                self.daemon_epoch = epoch
+                pid = discovered_pid
+
+            argv = self._base_argv() + [
+                "party",
+                "wait",
+                str(pid),
+                "--after-seq",
+                str(self.after_seq),
+                "--timeout-ms",
+                str(self.wait_timeout_ms),
+            ]
+            if self.daemon_epoch > 0:
+                argv.extend(["--cursor-epoch", str(self.daemon_epoch)])
+
+            proc: Any = None
+            try:
+                proc = self._popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                with self._lock:
+                    self._proc = proc
+                stdout, stderr = proc.communicate(timeout=(self.wait_timeout_ms / 1000.0) + 10.0)
+                rc = int(proc.returncode if proc.returncode is not None else 1)
+            except subprocess.TimeoutExpired:
+                self._terminate_active_proc()
+                continue
+            except OSError as exc:
+                self.last_error = redact_url_fragments(str(exc))
+                self._stop_event.wait(self._idle_backoff_s)
+                continue
+            finally:
+                with self._lock:
+                    if self._proc is proc:
+                        self._proc = None
+
+            if self._stop_event.is_set():
+                break
+
+            if rc != 0:
+                err_text = redact_url_fragments((stderr or stdout or "").strip())
+                err_lower = err_text.lower()
+                if "is not active" in err_lower or "code=4040" in err_lower:
+                    if not self._pinned_party:
+                        self.party_id = None
+                    self.after_seq = 0
+                    self.daemon_epoch = 0
+                self.last_error = err_text or f"mp-outpost exited with status {rc}"
+                self._stop_event.wait(self._idle_backoff_s)
+                continue
+
+            if not (stdout or "").strip():
+                continue
+
+            try:
+                resp = json.loads(stdout)
+            except json.JSONDecodeError:
+                self.last_error = "invalid json from mp-outpost party wait"
+                self._stop_event.wait(self._idle_backoff_s)
+                continue
+
+            if not isinstance(resp, dict):
+                continue
+
+            self.last_error = None
+            new_epoch = int(resp.get("daemon_epoch", self.daemon_epoch) or 0)
+            if new_epoch > 0:
+                self.daemon_epoch = new_epoch
+
+            cursor_reset = bool(resp.get("cursor_reset", False))
+            events_raw = resp.get("events") or []
+            max_seq = self.after_seq
+            for ev in events_raw:
+                if not isinstance(ev, dict):
+                    continue
+                ev_seq = int(ev.get("event_seq", ev.get("seq", 0)) or 0)
+                if ev_seq > max_seq:
+                    max_seq = ev_seq
+                kind = str(ev.get("kind", "unknown"))
+                if kind in ("membership_changed", "system"):
+                    continue
+                sender_client = sanitize_single_line(str(ev.get("sender_client", ev.get("client", ""))))
+                is_browser = bool(ev.get("is_browser", False)) or sender_client.lower() in ("web", "browser")
+                sender_device_id = int(ev.get("sender_device_id", 0) or 0)
+                if (
+                    not is_browser
+                    and self.self_device_id > 0
+                    and sender_device_id > 0
+                    and sender_device_id == self.self_device_id
+                ):
+                    continue
+                raw_body = _extract_event_body(ev)
+                clean_body = redact_url_fragments(sanitize_peer_text(raw_body)).strip()
+                if not clean_body:
+                    continue
+                handle = sanitize_single_line(str(ev.get("sender_handle", ev.get("from", "peer")))) or "peer"
+                if not handle.startswith("@"):
+                    handle = f"@{handle}"
+                origin_tag = " [browser]" if is_browser else ""
+                line = f"[party #{pid} {handle}{origin_tag}] {clean_body}"
+                self.received_count += 1
+                try:
+                    self._emit_fn(line)
+                except Exception:
+                    pass
+
+            if "next_seq" in resp and resp["next_seq"] is not None:
+                next_seq = int(resp["next_seq"])
+                self.after_seq = next_seq if cursor_reset else max(max_seq, next_seq)
+            else:
+                self.after_seq = max_seq
+
+
 __all__ = [
     "DEFAULT_SESSION_NAME",
+    "InlinePartyWatcher",
     "SecretRefusalError",
     "launch_detached_chat",
     "run_chat_in_place",

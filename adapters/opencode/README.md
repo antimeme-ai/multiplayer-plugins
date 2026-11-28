@@ -19,14 +19,14 @@ Add the plugin directory or package name to `opencode.json`:
 
 Existing `mcp.multiplayer` user overrides are preserved.
 
-## Native TUI Shortcut & Detached `phux` Party Chat
+## Native TUI Menu, Dialogs & Detached `phux` Party Chat
 
-This package exports both `./server` (`src/index.ts`, OpenCode v2 `{ id, setup(ctx) }`) and `./tui` (`src/tui.ts`) adding:
-- **Global Shortcut:** `ctrl+alt+m`
-- **Command Palette:** `Open Multiplayer Party Chat`
-- **Prompt Slash Command:** `/party-chat [target]` (alias `/mp-chat`)
-
-Invoking it starts or reuses a detached `phux` session (`multiplayer-chat`) running `mp-outpost chat` (resolving the absolute binary path for daemonized `phux`, with `tmux` / `omarchy-launch-tui` fallback) and displays a toast with `phux attach multiplayer-chat` and `phux native attach @<id>`.
+This package exports both `./server` (`src/index.ts`, OpenCode v2 `{ id, setup(ctx) }`) and `./tui` (`src/tui.ts`) adding native OpenCode v2 dialogs and slash commands:
+- **Global Shortcut & Quick Menu:** `ctrl+alt+m` or `/party` (alias `/mp`) — opens a native `dialog.select` menu for Party Chat, Send Message, Read Recent Messages, Party Status, Friends & Invites, and Listen Profile Status.
+- **Detached Party Chat:** `/party-chat [target]` (alias `/mp-chat`) — starts or reuses a detached `phux` session (`multiplayer-chat`) running `mp-outpost chat` (resolving the absolute binary path for daemonized `phux`, with `tmux` / `omarchy-launch-tui` fallback) and displays a toast with `phux attach multiplayer-chat` and `phux native attach @<id>`.
+- **Inline Send:** `/party-say [message]` (alias `/mp-say`) — sends directly or opens a native `dialog.prompt` composer, enforcing pre-execution secret refusal before spawning `mp-outpost`.
+- **Recent Feed:** `/party-read` (alias `/mp-read`) — displays the latest 15 sanitized messages in a native `dialog.alert` clearly labeled as untrusted external data.
+- **Status:** `/party-status` (alias `/mp-status`) — displays signed-in `@handle`, connection state, and active party details.
 
 ## Security & Verification
 

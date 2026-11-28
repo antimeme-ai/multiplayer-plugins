@@ -38,6 +38,7 @@ from .adapter import (
 )
 from .chat_launcher import (
     DEFAULT_SESSION_NAME,
+    InlinePartyWatcher,
     launch_detached_chat,
     run_chat_in_place,
 )
@@ -694,12 +695,79 @@ def _cli_entrypoint(args: Any) -> int:
     return int(code)
 
 
+_AMBIGUOUS_SAY_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "--scope",
+        "--to-device",
+        "--json",
+        "--state-dir",
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+    }
+)
+
+
+def _send_party_say_sync(
+    message: str,
+    *,
+    binary: str = "mp-outpost",
+    state_dir: str | None = None,
+    runner: CommandRunner | None = None,
+) -> tuple[bool, str]:
+    """Send a secret-checked message to the active party synchronously (for `/party-say`)."""
+    body = message.strip()
+    if not body:
+        return False, "Usage: /party-say <message>"
+    if body in _AMBIGUOUS_SAY_FLAGS or body.startswith("--") and " " not in body:
+        return False, "Refused message: bare CLI option flag is ambiguous."
+    try:
+        refuse_secrets(body)
+    except SecretRefusalError as exc:
+        return False, str(exc)
+
+    run_cmd = runner or _default_sync_runner
+    base = [binary]
+    if state_dir:
+        base.extend(["--state-dir", state_dir])
+    base.append("--json")
+
+    try:
+        list_proc = run_cmd(base + ["party", "list"], 5.0)
+    except FileNotFoundError:
+        return False, f"mp-outpost binary '{binary}' not found on PATH."
+    except subprocess.TimeoutExpired:
+        return False, "Timed out querying active party."
+    if list_proc.returncode != 0 or not (list_proc.stdout or "").strip():
+        err = redact_url_fragments((list_proc.stderr or list_proc.stdout or "").strip())
+        return False, err or "Failed to query active party."
+    try:
+        listed = json.loads(list_proc.stdout)
+    except json.JSONDecodeError:
+        return False, "Invalid JSON from mp-outpost party list."
+    parties = listed.get("parties") or [] if isinstance(listed, dict) else []
+    if not parties:
+        return False, "No active multiplayer party found. Join or open one first with /party-join or /party-invite."
+    pid = int(parties[0]["party_id"])
+
+    try:
+        say_proc = run_cmd(base + ["party", "say", str(pid), "--scope", "party/main", body], 10.0)
+    except subprocess.TimeoutExpired:
+        return False, f"Timed out sending message to party #{pid}."
+    if say_proc.returncode != 0:
+        err = redact_url_fragments((say_proc.stderr or say_proc.stdout or "").strip())
+        return False, err or f"Failed to send message to party #{pid}."
+    return True, f"Sent to party #{pid}."
+
+
 def _make_slash_handler(
     action: str,
     *,
     binary: str = "mp-outpost",
     runner: CommandRunner | None = None,
     shared_read_hook: UnreadNotificationHook | None = None,
+    shared_inline_watcher: InlinePartyWatcher | None = None,
 ) -> Callable[[str], str]:
     """Build a synchronous Hermes in-session slash command handler for `/party-*`."""
 
@@ -708,6 +776,21 @@ def _make_slash_handler(
 
         target = raw_args.strip() or None
         if action == "chat":
+            if target and (target == "--inline" or target.startswith("--inline ")):
+                watcher = shared_inline_watcher
+                if watcher is None:
+                    watcher = InlinePartyWatcher(outpost_binary=binary)
+                sub = target[len("--inline"):].strip()
+                sub_lower = sub.lower()
+                if sub_lower in ("off", "stop"):
+                    return str(watcher.stop()["message"])
+                if sub_lower == "status":
+                    return str(watcher.status()["message"])
+                inline_target = None if sub_lower in ("", "on", "start") else sub
+                try:
+                    return str(watcher.start(target=inline_target)["message"])
+                except ValueError as exc:
+                    return str(exc)
             in_place = False
             chat_target = target
             if chat_target and chat_target.startswith("--in-place"):
@@ -724,6 +807,9 @@ def _make_slash_handler(
                 return str(res["message"])
             except ValueError as exc:
                 return str(exc)
+        if action == "say":
+            _ok, msg = _send_party_say_sync(raw_args, binary=binary, runner=runner)
+            return msg
         if action == "read":
             hook = shared_read_hook
             if hook is None:
@@ -835,6 +921,7 @@ def register(ctx: Any) -> dict[str, Any]:
         seed_from_head=True,
     )
     shared_read_hook = UnreadNotificationHook(enabled=True, seed_from_head=False)
+    shared_inline_watcher = InlinePartyWatcher()
     if hasattr(ctx, "register_hook"):
         ctx.register_hook("pre_llm_call", unread_hook)
         registered["hooks"].append("pre_llm_call")
@@ -851,7 +938,13 @@ def register(ctx: Any) -> dict[str, Any]:
     if hasattr(ctx, "register_command"):
         slash_specs = (
             ("party-status", "status", "Show mp-outpost auth, encryption posture, and active party status", ""),
-            ("party-chat", "chat", "Open mp-outpost party chat in a detached phux window (or --in-place)", "[--in-place] [target]"),
+            (
+                "party-chat",
+                "chat",
+                "Open party chat in detached phux, --inline [on|off|status] live feed, or --in-place",
+                "[--inline [on|off|status] | --in-place] [target]",
+            ),
+            ("party-say", "say", "Send a message directly to the active multiplayer.tech party (secret-checked)", "<message>"),
             ("party-listen", "listen", "Inspect or toggle opt-in mp-outpost listen profile (status|profiles|on|off)", "[status|profiles|on|off]"),
             ("party-invite", "invite", "Open or reuse an mp2 party and optionally send an addressed invite to @handle", "[@handle] [--name <name>]"),
             ("party-join", "join", "Join a party by accepting latest invite, @handle, room code, or numeric party ID", "[target] [--agent-name <name>]"),
@@ -862,7 +955,11 @@ def register(ctx: Any) -> dict[str, Any]:
         for cmd_name, action, desc, args_hint in slash_specs:
             ctx.register_command(
                 cmd_name,
-                _make_slash_handler(action, shared_read_hook=shared_read_hook),
+                _make_slash_handler(
+                    action,
+                    shared_read_hook=shared_read_hook,
+                    shared_inline_watcher=shared_inline_watcher,
+                ),
                 description=desc,
                 args_hint=args_hint,
             )
@@ -907,6 +1004,7 @@ __all__ = [
     "DEFAULT_HERMES_CONNECT_TIMEOUT_S",
     "DEFAULT_HERMES_MCP_TIMEOUT_S",
     "FencedPeerMessage",
+    "InlinePartyWatcher",
     "MIN_PARTY_WAIT_TOOL_TIMEOUT_S",
     "MultiplayerPlatformAdapter",
     "OutpostEofError",

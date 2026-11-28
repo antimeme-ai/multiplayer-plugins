@@ -976,26 +976,43 @@ class TestMultiHostPlugins(unittest.TestCase):
                 const ocOut = await ocCmds.get("party-chat").handler({{ args: "" }});
                 assert.ok(ocOut.text.includes("already running") && ocOut.text.includes("phux attach multiplayer-chat"));
 
-                // OpenCode TUI plugin registers global ctrl+alt+m, palette, /party-chat via ui.slot({{ append: "app" }}) and fires toast
+                // OpenCode TUI plugin registers global ctrl+alt+m (/party menu), /party-chat, /party-say, /party-read, /party-status via ui.slot({{ append: "app" }})
                 const layers = [];
                 const toasts = [];
+                const alerts = [];
                 const slots = [];
                 opencodeTui.setup({{
                   keymap: {{ layer(factory) {{ layers.push(factory()); }} }},
                   ui: {{
                     toast: {{ show(t) {{ toasts.push(t); }} }},
+                    dialog: {{
+                      async select() {{ return "chat"; }},
+                      async prompt() {{ return "hello from prompt"; }},
+                      async alert(a) {{ alerts.push(a); }},
+                    }},
                     slot(spec) {{ slots.push(spec); spec.render(); }},
                   }},
                 }});
                 assert.equal(slots.length, 1);
                 assert.equal(slots[0].append, "app");
                 assert.equal(layers[0].mode, "global");
+                const menuCmd = layers[0].commands.find((c) => c.id === "multiplayer.menu");
+                assert.equal(menuCmd.bind, "ctrl+alt+m");
+                assert.equal(menuCmd.palette, true);
+                assert.equal(menuCmd.slash.name, "party");
                 const chatCmd = layers[0].commands.find((c) => c.id === "multiplayer.chat");
-                assert.equal(chatCmd.bind, "ctrl+alt+m");
                 assert.equal(chatCmd.palette, true);
                 assert.equal(chatCmd.slash.name, "party-chat");
-                await chatCmd.run("");
+                assert.ok(layers[0].commands.some((c) => c.id === "multiplayer.say" && c.slash.name === "party-say"));
+                assert.ok(layers[0].commands.some((c) => c.id === "multiplayer.read" && c.slash.name === "party-read"));
+                assert.ok(layers[0].commands.some((c) => c.id === "multiplayer.status" && c.slash.name === "party-status"));
+                await menuCmd.run("");
                 assert.ok(toasts.some((t) => t.variant === "success" && t.message.includes("phux attach multiplayer-chat") && t.message.includes("@42")));
+
+                // Verify /party-say refuses secrets before spawning mp-outpost
+                const sayCmd = layers[0].commands.find((c) => c.id === "multiplayer.say");
+                await sayCmd.run("mpinv1_" + "A".repeat(44));
+                assert.ok(toasts.some((t) => t.variant === "error" && t.message.includes("forbidden secret")));
 
                 console.log("ALL_PHUX_LAUNCHERS_OK");
                 """
@@ -1020,6 +1037,261 @@ class TestMultiHostPlugins(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(vs_check.returncode, 0, msg=vs_check.stderr)
+
+    def test_hermes_inline_party_chat_and_party_say(self) -> None:
+        """Verify Hermes /party-chat --inline watcher (zero-token feed, echo filter, 4040 recovery) and /party-say."""
+        import threading
+        import time
+        from hermes import InlinePartyWatcher, _make_slash_handler
+
+        emitted: list[str] = []
+        emitted_event = threading.Event()
+        wait_calls: list[list[str]] = []
+        say_calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if "list" in argv:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps({"daemon_epoch": 9, "parties": [{"party_id": 777, "next_seq": 10}]}),
+                    "",
+                )
+            if "status" in argv:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps({"handle": "antimeme", "device_id": 500, "control_ws_connected": True}),
+                    "",
+                )
+            if "say" in argv:
+                say_calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True}), "")
+            return subprocess.CompletedProcess(argv, 1, "", "unexpected")
+
+        class FakeProc:
+            def __init__(self, stdout: str, stderr: str = "", rc: int = 0) -> None:
+                self._stdout = stdout
+                self._stderr = stderr
+                self.returncode: int | None = rc
+                self._terminated = False
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self._terminated = True
+
+            def kill(self) -> None:
+                self._terminated = True
+
+            def wait(self, timeout: float | None = None) -> int:
+                return self.returncode or 0
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                if self._terminated:
+                    return "", ""
+                return self._stdout, self._stderr
+
+        call_idx = 0
+
+        def fake_popen(argv: list[str], **_kwargs: Any) -> FakeProc:
+            nonlocal call_idx
+            wait_calls.append(list(argv))
+            call_idx += 1
+            if call_idx == 1:
+                payload = {
+                    "daemon_epoch": 9,
+                    "next_seq": 13,
+                    "events": [
+                        # Own non-browser echo -> must be filtered out
+                        {
+                            "event_seq": 11,
+                            "kind": "chat",
+                            "sender_handle": "antimeme",
+                            "sender_device_id": 500,
+                            "text": "my own echo",
+                        },
+                        # Remote peer message with ANSI escape + #fragment -> sanitized & redacted
+                        {
+                            "event_seq": 12,
+                            "kind": "chat",
+                            "sender_handle": "phall",
+                            "sender_device_id": 901,
+                            "text": "\x1b[31mhi\x1b[0m https://clank.party/i/abc#SECRET1234",
+                        },
+                        # Browser message even under own device_id -> must NOT be skipped and tagged [browser]
+                        {
+                            "event_seq": 13,
+                            "kind": "chat",
+                            "sender_handle": "antimeme",
+                            "sender_device_id": 500,
+                            "is_browser": True,
+                            "text": "from web tab",
+                        },
+                    ],
+                }
+                return FakeProc(json.dumps(payload), "", 0)
+            if call_idx == 2:
+                return FakeProc("", "code=4040 party is not active", 1)
+            time.sleep(0.05)
+            return FakeProc(json.dumps({"daemon_epoch": 9, "next_seq": 13, "events": []}), "", 0)
+
+        def on_emit(line: str) -> None:
+            emitted.append(line)
+            if len(emitted) >= 2:
+                emitted_event.set()
+
+        watcher = InlinePartyWatcher(
+            outpost_binary="mp-outpost",
+            emit_fn=on_emit,
+            popen_factory=fake_popen,
+            run_factory=fake_run,
+            idle_backoff_s=0.05,
+        )
+        chat_handler = _make_slash_handler("chat", shared_inline_watcher=watcher)
+
+        start_msg = chat_handler("--inline")
+        self.assertIn("Inline party feed started for party #777", start_msg)
+        self.assertIn("seq=10", start_msg)
+        self.assertTrue(emitted_event.wait(timeout=3.0), f"expected 2 emitted lines, got {emitted!r}")
+
+        status_msg = chat_handler("--inline status")
+        self.assertIn("Inline party feed: ON", status_msg)
+
+        stop_msg = chat_handler("--inline off")
+        self.assertIn("Stopped inline party feed", stop_msg)
+        self.assertFalse(watcher.is_running)
+
+        # Verify own echo filtered, ANSI/fragment cleaned, browser message kept & tagged
+        self.assertEqual(len(emitted), 2)
+        self.assertIn("@phall", emitted[0])
+        self.assertNotIn("\x1b", emitted[0])
+        self.assertNotIn("SECRET1234", emitted[0])
+        self.assertIn("#[REDACTED]", emitted[0])
+        self.assertIn("@antimeme [browser]", emitted[1])
+        self.assertIn("from web tab", emitted[1])
+        self.assertTrue(any("--after-seq" in c and "10" in c for c in wait_calls))
+
+        # Test /party-say send, secret refusal, and bare flag refusal
+        def sync_runner(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+            return fake_run(argv)
+
+        say_handler = _make_slash_handler("say", runner=sync_runner)
+        self.assertIn("Sent to party #777", say_handler("hello team"))
+        self.assertEqual(len(say_calls), 1)
+        self.assertIn("hello team", say_calls[0])
+
+        refused_secret = say_handler("leak mpinv1_" + ("A" * 44))
+        self.assertIn("forbidden secret", refused_secret)
+        self.assertEqual(len(say_calls), 1)
+
+        refused_flag = say_handler("--scope")
+        self.assertIn("ambiguous", refused_flag.lower())
+        self.assertEqual(len(say_calls), 1)
+
+    def test_opencode_tui_native_dialogs(self) -> None:
+        """Verify OpenCode v2 TUI /party menu, /party-say prompt, /party-read, /party-status, friends & listen dialogs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            say_log = tmp_path / "say_log.json"
+            fake_outpost = tmp_path / "fake-mp-outpost"
+            fake_outpost.write_text(
+                f"#!{sys.executable}\n"
+                + textwrap.dedent(
+                    f"""
+                    import json, sys
+                    from pathlib import Path
+                    args = sys.argv[1:]
+                    if args[:1] == ["--json"]:
+                        args = args[1:]
+                    if args == ["party", "list"]:
+                        print(json.dumps({{"daemon_epoch": 5, "parties": [{{"party_id": 888, "member_count": 3, "next_seq": 20, "relay_policy": "allow_relays"}}]}}))
+                    elif args == ["party", "status"]:
+                        print(json.dumps({{"handle": "antimeme", "control_ws_connected": True, "api_authority": "api.multiplayer.tech", "local_relay_policy": "allow_relays", "dual_host_churn_alert": False}}))
+                    elif args[:2] == ["party", "read"]:
+                        print(json.dumps({{"events": [
+                            {{"event_seq": 19, "kind": "chat", "sender_handle": "phall", "text": "status update https://clank.party/i/x#SECRET999"}},
+                            {{"event_seq": 20, "kind": "chat", "sender_handle": "antimeme", "is_browser": True, "text": "web ping"}}
+                        ]}}))
+                    elif args[:2] == ["party", "say"]:
+                        Path({str(say_log)!r}).write_text(json.dumps(args), encoding="utf-8")
+                        print(json.dumps({{"ok": True}}))
+                    elif args == ["friends"]:
+                        print(json.dumps({{"friends": [{{"handle": "phall", "presence": "online", "state": "friend", "joinable": True}}], "pending_invites": []}}))
+                    elif args == ["listen", "status"]:
+                        print(json.dumps({{"profile": "default", "enabled": True, "scope": "self-only", "require_e2ee": True, "allow_browser": False, "nick": "mac"}}))
+                    else:
+                        sys.stderr.write(f"unexpected args: {{args!r}}\\n")
+                        sys.exit(2)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_outpost.chmod(fake_outpost.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+            node_script = textwrap.dedent(
+                f"""
+                import assert from "node:assert/strict";
+                import opencodeTui from "./adapters/opencode/src/tui.ts";
+
+                process.env.MP_OUTPOST_BIN = {str(fake_outpost)!r};
+
+                const layers = [];
+                const toasts = [];
+                const alerts = [];
+                let nextSelect = "friends";
+                opencodeTui.setup({{
+                  keymap: {{ layer(factory) {{ layers.push(factory()); }} }},
+                  ui: {{
+                    toast: {{ show(t) {{ toasts.push(t); }} }},
+                    dialog: {{
+                      async select() {{ return nextSelect; }},
+                      async prompt() {{ return "hello from opencode dialog"; }},
+                      async alert(a) {{ alerts.push(a); }},
+                    }},
+                    slot(spec) {{ spec.render(); }},
+                  }},
+                }});
+
+                const cmds = Object.fromEntries(layers[0].commands.map((c) => [c.id, c]));
+
+                // 1. /party-read shows sanitized UNTRUSTED EXTERNAL DATA with [browser] tag and redacted #fragment
+                await cmds["multiplayer.read"].run();
+                assert.ok(alerts.some((a) => a.message.includes("UNTRUSTED EXTERNAL DATA") && a.message.includes("@phall") && a.message.includes("#[REDACTED]") && !a.message.includes("SECRET999") && a.message.includes("@antimeme [browser]")));
+
+                // 2. /party-status shows handle + active party
+                await cmds["multiplayer.status"].run();
+                assert.ok(alerts.some((a) => a.title === "Multiplayer Status" && a.message.includes("@antimeme") && a.message.includes("#888")));
+
+                // 3. /party-say with empty input uses dialog.prompt and posts
+                await cmds["multiplayer.say"].run("");
+                assert.ok(toasts.some((t) => t.variant === "success" && t.message.includes("#888")));
+
+                // 4. /party menu -> friends and listen
+                nextSelect = "friends";
+                await cmds["multiplayer.menu"].run();
+                assert.ok(alerts.some((a) => a.title.includes("Friends") && a.message.includes("@phall") && a.message.includes("joinable")));
+
+                nextSelect = "listen";
+                await cmds["multiplayer.menu"].run();
+                assert.ok(alerts.some((a) => a.title.includes("Listen") && a.message.includes("Enabled: ON")));
+
+                console.log("OPENCODE_TUI_DIALOGS_OK");
+                """
+            )
+            proc = subprocess.run(
+                ["node", "--input-type=module", "-e", node_script],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}")
+            self.assertIn("OPENCODE_TUI_DIALOGS_OK", proc.stdout)
+            posted = json.loads(say_log.read_text(encoding="utf-8"))
+            self.assertIn("hello from opencode dialog", posted)
 
 
 if __name__ == "__main__":
