@@ -5,6 +5,9 @@
  */
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { detectForbiddenSecret } from "./security.ts";
 
 export interface DetachedChatResult {
@@ -69,17 +72,71 @@ async function execCapture(
   });
 }
 
+function resolveBinaryPath(binary: string): string {
+  if (!binary || binary.includes("/") || binary.includes("\\")) return binary;
+  const searchDirs = [
+    ...(process.env.PATH ? process.env.PATH.split(path.delimiter) : []),
+    path.join(os.homedir(), ".local", "bin"),
+    path.join(os.homedir(), ".cargo", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+  for (const dir of searchDirs) {
+    if (!dir) continue;
+    const cand = path.join(dir, binary);
+    try {
+      fs.accessSync(cand, fs.constants.X_OK);
+      if (fs.statSync(cand).isFile()) return cand;
+    } catch {
+      // continue
+    }
+  }
+  return binary;
+}
+
+function formatTerminalAddress(val: unknown): string | undefined {
+  if (typeof val === "number" && Number.isInteger(val) && val > 0) return `@${val}`;
+  if (typeof val === "string") {
+    const cleaned = val.trim();
+    if (!cleaned) return undefined;
+    if (/^\d+$/.test(cleaned)) return `@${cleaned}`;
+    return cleaned;
+  }
+  return undefined;
+}
+
 function extractPaneId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
   const obj = payload as Record<string, unknown>;
+  if ("terminal_id" in obj) {
+    const addr = formatTerminalAddress(obj.terminal_id);
+    if (addr) return addr;
+  }
   for (const k of ["terminal", "pane", "pane_id", "id"]) {
-    if (typeof obj[k] === "string" && (obj[k] as string).trim()) {
-      return (obj[k] as string).trim();
-    }
+    const addr = formatTerminalAddress(obj[k]);
+    if (addr) return addr;
   }
   for (const k of ["pane", "terminal", "seed", "result"]) {
     const nested = extractPaneId(obj[k]);
     if (nested) return nested;
+  }
+  return undefined;
+}
+
+function extractActiveTerminal(lsData: unknown, session: string): string | undefined {
+  if (!lsData || typeof lsData !== "object" || Array.isArray(lsData)) return undefined;
+  const hosts = (lsData as { hosts?: unknown[] }).hosts;
+  if (!Array.isArray(hosts)) return undefined;
+  for (const host of hosts) {
+    if (!host || typeof host !== "object") continue;
+    const sessions = (host as { sessions?: unknown[] }).sessions;
+    if (!Array.isArray(sessions)) continue;
+    for (const s of sessions) {
+      if (s && typeof s === "object" && (s as { name?: unknown }).name === session) {
+        const addr = formatTerminalAddress((s as { active_terminal?: unknown }).active_terminal);
+        if (addr) return addr;
+      }
+    }
   }
   return undefined;
 }
@@ -107,6 +164,7 @@ export function validateChatTarget(raw?: string): string | undefined {
 
 export async function launchDetachedPartyChat(options?: {
   outpostBinary?: string;
+  stateDir?: string;
   target?: string;
   session?: string;
   phuxBinary?: string;
@@ -118,14 +176,20 @@ export async function launchDetachedPartyChat(options?: {
     throw new Error(`Invalid session name '${session}'.`);
   }
   const cleanTarget = validateChatTarget(options?.target);
-  const outpostCmd = [options?.outpostBinary?.trim() || "mp-outpost", "chat"];
+  const resolvedOutpost = resolveBinaryPath(options?.outpostBinary?.trim() || "mp-outpost");
+  const outpostCmd = [resolvedOutpost];
+  if (options?.stateDir?.trim()) {
+    outpostCmd.push("--state-dir", options.stateDir.trim());
+  }
+  outpostCmd.push("chat");
   if (cleanTarget) outpostCmd.push(cleanTarget);
 
-  const phuxBin = options?.phuxBinary ?? process.env.PHUX_BIN?.trim() ?? "phux";
+  const phuxBin = resolveBinaryPath(options?.phuxBinary ?? process.env.PHUX_BIN?.trim() ?? "phux");
   const lsRes = await execCapture(phuxBin, ["ls", "--json"]);
   if (!lsRes.notFound) {
     let existingRunning = false;
     let existingFound = false;
+    let existingTerminal: string | undefined;
     if (lsRes.code === 0 && lsRes.stdout) {
       try {
         const parsed = JSON.parse(lsRes.stdout) as {
@@ -136,6 +200,7 @@ export async function launchDetachedPartyChat(options?: {
           existingFound = true;
           const active = Number(found.exec?.running ?? 0) + Number(found.exec?.starting ?? 0);
           existingRunning = active > 0;
+          if (existingRunning) existingTerminal = extractActiveTerminal(parsed, session);
         }
       } catch {
         // Proceed to create
@@ -143,14 +208,16 @@ export async function launchDetachedPartyChat(options?: {
     }
 
     if (existingRunning) {
+      const nativeCmd = existingTerminal ? `phux native attach ${existingTerminal}` : undefined;
       return {
         ok: true,
         backend: "phux",
         session,
+        ...(existingTerminal ? { paneId: existingTerminal } : {}),
         reused: true,
         attachCmd: `phux attach ${session}`,
-        nativeCmd: `phux native attach ${session}:0.0`,
-        message: `Party chat is already running in detached phux session '${session}'. Grab it with: phux attach ${session}`,
+        ...(nativeCmd ? { nativeCmd } : {}),
+        message: `Party chat is already running in detached phux session '${session}'${existingTerminal ? ` (${existingTerminal})` : ""}. Grab it with: phux attach ${session}${nativeCmd ? ` (or window: ${nativeCmd})` : ""}`,
       };
     }
 
@@ -168,7 +235,7 @@ export async function launchDetachedPartyChat(options?: {
           // ignore
         }
       }
-      const nativeTarget = paneId ?? `${session}:0.0`;
+      const nativeCmd = paneId ? `phux native attach ${paneId}` : undefined;
       return {
         ok: true,
         backend: "phux",
@@ -176,9 +243,12 @@ export async function launchDetachedPartyChat(options?: {
         ...(paneId ? { paneId } : {}),
         reused: false,
         attachCmd: `phux attach ${session}`,
-        nativeCmd: `phux native attach ${nativeTarget}`,
-        message: `Started detached phux party chat in '${session}'${paneId ? ` (${paneId})` : ""}. Grab it with: phux attach ${session} (or window: phux native attach ${nativeTarget})`,
+        ...(nativeCmd ? { nativeCmd } : {}),
+        message: `Started detached phux party chat in '${session}'${paneId ? ` (${paneId})` : ""}. Grab it with: phux attach ${session}${nativeCmd ? ` (or window: ${nativeCmd})` : ""}`,
       };
+    }
+    if (created.stdout.includes("spawn_failed") || created.stderr.includes("spawn_failed")) {
+      await execCapture(phuxBin, ["kill", "--yes", session]);
     }
   }
 

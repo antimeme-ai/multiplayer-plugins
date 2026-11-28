@@ -390,6 +390,10 @@ export function formatPartyEvent(ev: OutpostPartyEvent): string {
   const kind = sanitizeSingleLine(String(ev.kind ?? "unknown"));
   const handle = sanitizeSingleLine(String(ev.sender_handle ?? ev.from ?? "system"));
   const accountId = Number.isSafeInteger(ev.sender_account_id) ? ev.sender_account_id : 0;
+  const deviceId = Number.isSafeInteger(ev.sender_device_id) && (ev.sender_device_id as number) > 0
+    ? ev.sender_device_id
+    : 0;
+  const deviceTag = deviceId > 0 ? ` device=${deviceId}` : "";
   const browserTag = isBrowserOriginEvent(ev) ? " origin=browser" : "";
   const catchupTag =
     ev.is_historical_catchup === true
@@ -397,7 +401,7 @@ export function formatPartyEvent(ev: OutpostPartyEvent): string {
       : ev.is_historical_catchup === false
         ? " historical_catchup=false"
         : " replay_provenance=unknown";
-  const header = `[seq=${seq} kind=${kind} from=${handle}(${accountId})${browserTag}${catchupTag}]`;
+  const header = `[seq=${seq} kind=${kind} from=${handle}(${accountId})${deviceTag}${browserTag}${catchupTag}]`;
 
   let payloadRaw: string;
   if (ev.kind === "chat_message" || ev.kind === "chat") {
@@ -439,6 +443,8 @@ export interface OutpostInboxDrop {
   drop_id?: number;
   sender_handle?: string;
   sender_account_id?: number;
+  sender_device_id?: number;
+  safety_number?: string;
   created_at_ms?: number;
   expires_at_ms?: number;
   body?: string;
@@ -448,5 +454,9 @@ export function formatInboxDrop(drop: OutpostInboxDrop): string {
   const dropId = Number.isSafeInteger(drop.drop_id) ? drop.drop_id : 0;
   const handle = sanitizeSingleLine(String(drop.sender_handle ?? "unknown"));
   const accountId = Number.isSafeInteger(drop.sender_account_id) ? drop.sender_account_id : 0;
-  return `[drop_id=${dropId} from=${handle}(${accountId}) untrusted_remote=true]\n${fencePeerText(String(drop.body ?? ""))}`;
+  const deviceTag =
+    Number.isSafeInteger(drop.sender_device_id) && (drop.sender_device_id as number) > 0
+      ? ` device=${drop.sender_device_id}`
+      : "";
+  return `[drop_id=${dropId} from=${handle}(${accountId})${deviceTag} untrusted_remote=true]\n${fencePeerText(String(drop.body ?? ""))}`;
 }

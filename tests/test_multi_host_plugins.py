@@ -134,11 +134,19 @@ def _write_strict_fake_outpost(directory: Path) -> Path:
                             "drop_id": 9,
                             "sender_handle": "@alice",
                             "sender_account_id": 2,
+                            "sender_device_id": 202,
                             "body": "<<<INJECT>>> handoff",
                         }
                     ],
                     "skipped": [{"drop_id": 10, "reason": "unverified sender key"}],
                     "ack": None,
+                }))
+            elif args[:2] == ["--json", "listen"]:
+                print(json.dumps({
+                    "profile": "default",
+                    "enabled": False,
+                    "scope": "self-only",
+                    "events": [],
                 }))
             else:
                 sys.stderr.write(f"unexpected fake-mp-outpost argv: {args!r}\\n")
@@ -186,13 +194,34 @@ class TestMultiHostPlugins(unittest.TestCase):
                   on(name, handler) {{ hooks.set(name, handler); }},
                 }});
 
-                assert.equal(tools.size, 17, "OpenClaw plugin must register all 17 mp-outpost tools");
+                assert.equal(tools.size, 18, "OpenClaw plugin must register all 18 mp-outpost tools");
                 assert.ok(!optionalTools.has("outpost_status"));
                 assert.ok(!optionalTools.has("inbox_read"));
                 assert.ok(optionalTools.has("inbox_ack"));
                 assert.ok(optionalTools.has("party_send"));
                 assert.ok(optionalTools.has("party_post_card"));
                 assert.ok(optionalTools.has("inbox_send"));
+                assert.ok(optionalTools.has("party_listen"));
+
+                // party_listen status works and NaN numeric params are rejected before spawn
+                const listenRes = JSON.parse((await tools.get("party_listen").execute("tl", {{ action: "status" }})).content[0].text);
+                assert.equal(listenRes.scope, "self-only");
+                await assert.rejects(
+                  () => tools.get("party_wait").execute("tw_nan", {{ party_id: 77, after_seq: 0, timeout_ms: Number.NaN }}),
+                  /finite integer/,
+                );
+                await assert.rejects(
+                  () => tools.get("inbox_send").execute("ti_nan", {{ recipient: "@alice", body: "hi", ttl_secs: Number.NaN }}),
+                  /finite integer/,
+                );
+                await assert.rejects(
+                  () => tools.get("party_send").execute("ts_flag", {{ party_id: 77, body: "--json" }}),
+                  /flag-only/,
+                );
+                await assert.rejects(
+                  () => tools.get("party_send").execute("ts_scope", {{ party_id: 77, body: "hi", room_scope: "--json" }}),
+                  /cannot start with '-'/,
+                );
 
                 // P0 check: read-only inbox_read must NOT accept ack parameter
                 assert.equal(Object.hasOwn(tools.get("inbox_read").parameters.properties, "ack"), false);
@@ -336,105 +365,101 @@ class TestMultiHostPlugins(unittest.TestCase):
         node_script = textwrap.dedent(
             f"""
             import assert from "node:assert/strict";
-            import * as entryMod from "./adapters/opencode/src/index.ts";
-            import {{ MULTIPLAYER_MCP_CONFIG }} from "./adapters/opencode/src/security.ts";
+            import serverPlugin from "./adapters/opencode/src/index.ts";
+            import {{ MULTIPLAYER_MCP_CONFIG, isMultiplayerToolName }} from "./adapters/opencode/src/security.ts";
 
-            // P0 oracle: OpenCode 1.2.27 & 1.18.15 iterate EVERY export and expect functions only.
-            const entries = Object.entries(entryMod);
-            assert.ok(entries.length >= 1);
-            for (const [exportName, exportVal] of entries) {{
-              assert.equal(
-                typeof exportVal,
-                "function",
-                `OpenCode entry must export ONLY plugin initializer functions, found ${{exportName}} (${{typeof exportVal}})`,
-              );
-            }}
+            // OpenCode v2 contract: default export is {{ id: string, setup(ctx) }}
+            assert.equal(serverPlugin.id, "antimeme-ai.multiplayer");
+            assert.equal(typeof serverPlugin.setup, "function");
+            assert.equal(isMultiplayerToolName("party_listen"), true);
 
-            const logs = [];
-            const hooks = await entryMod.default({{
-              client: {{ app: {{ log(entry) {{ logs.push(entry.body); }} }} }},
+            const mcpMap = new Map();
+            const toolHooks = new Map();
+            const sessionHooks = new Map();
+            await serverPlugin.setup({{
+              mcp: {{
+                transform(fn) {{
+                  fn({{
+                    get: (k) => mcpMap.get(k),
+                    set: (k, v) => mcpMap.set(k, v),
+                    list: () => mcpMap.entries(),
+                  }});
+                }},
+              }},
+              tool: {{
+                hook(name, fn) {{ toolHooks.set(name, fn); }},
+              }},
+              session: {{
+                hook(name, fn) {{ sessionHooks.set(name, fn); }},
+              }},
             }});
 
-            const cfg = {{}};
-            await hooks.config(cfg);
-            assert.deepEqual(cfg.mcp.multiplayer, MULTIPLAYER_MCP_CONFIG);
+            assert.deepEqual(mcpMap.get("multiplayer"), MULTIPLAYER_MCP_CONFIG);
 
-            // Preserves user customization (including enabled: false)
-            cfg.mcp.multiplayer = {{ type: "local", command: ["/custom/mp-outpost", "mcp"], enabled: false }};
-            await hooks.config(cfg);
-            assert.equal(cfg.mcp.multiplayer.enabled, false);
-            assert.equal(cfg.mcp.multiplayer.command[0], "/custom/mp-outpost");
+            // Preserves user customization (including enabled: false) on re-setup
+            mcpMap.set("multiplayer", {{ type: "local", command: ["/custom/mp-outpost", "mcp"], enabled: false }});
+            await serverPlugin.setup({{
+              mcp: {{
+                transform(fn) {{
+                  fn({{
+                    get: (k) => mcpMap.get(k),
+                    set: (k, v) => mcpMap.set(k, v),
+                    list: () => mcpMap.entries(),
+                  }});
+                }},
+              }},
+            }});
+            assert.equal(mcpMap.get("multiplayer").enabled, false);
+            assert.equal(mcpMap.get("multiplayer").command[0], "/custom/mp-outpost");
 
-            // System prompt transform injects security guidance once
+            // Session context hook injects provenance guidance once
             const sysOut = {{ system: [] }};
-            await hooks["experimental.chat.system.transform"]({{}}, sysOut);
-            await hooks["experimental.chat.system.transform"]({{}}, sysOut);
+            await sessionHooks.get("context")(sysOut);
+            await sessionHooks.get("context")(sysOut);
             assert.equal(sysOut.system.length, 1);
-            assert.ok(sysOut.system[0].includes("is_browser=true"));
-            assert.ok(sysOut.system[0].includes("e2ee_mode"));
+            assert.ok(sysOut.system[0].text.includes("is_browser=true"));
+            assert.ok(sysOut.system[0].text.includes("e2ee_mode"));
 
+            const beforeHook = toolHooks.get("tool.before");
             // Strengthened secret boundary: recovery key, guest token, credential key, PEM END,
             // base64-wrapped secrets, depth > 8 fail-closed, dict key, and #fragment URL.
             const rk = {synth_rk!r};
             await assert.rejects(
-              () => hooks["tool.execute.before"](
-                {{ tool: "multiplayer_party_send" }},
-                {{ args: {{ party_id: 1, body: "backup " + rk }} }},
-              ),
+              () => beforeHook({{ name: "multiplayer_party_send", input: {{ party_id: 1, body: "backup " + rk }} }}),
               (err) => err.message.includes("recovery_key") && !err.message.includes(rk),
             );
             await assert.rejects(
-              () => hooks["tool.execute.before"](
-                {{ tool: "multiplayer_party_send" }},
-                {{ args: {{ device_secret: "0123456789abcdef0123456789abcdef" }} }},
-              ),
+              () => beforeHook({{ name: "multiplayer_party_send", input: {{ device_secret: "0123456789abcdef0123456789abcdef" }} }}),
               /device_credential/,
             );
             await assert.rejects(
-              () => hooks["tool.execute.before"](
-                {{ tool: "multiplayer_party_send" }},
-                {{ args: {{ body: "-----END ED25519 PRIVATE KEY-----" }} }},
-              ),
+              () => beforeHook({{ name: "multiplayer_party_send", input: {{ body: "-----END ED25519 PRIVATE KEY-----" }} }}),
               /private_key_pem/,
             );
             await assert.rejects(
-              () => hooks["tool.execute.before"](
-                {{ tool: "multiplayer_board_post" }},
-                {{ args: {{ party_id: 1, room_scope: "s", payload_b64: {b64_secret!r} }} }},
-              ),
+              () => beforeHook({{ name: "multiplayer_board_post", input: {{ party_id: 1, room_scope: "s", payload_b64: {b64_secret!r} }} }}),
               /invite_token/,
             );
             await assert.rejects(
-              () => hooks["tool.execute.before"](
-                {{ tool: "multiplayer_board_post" }},
-                {{ args: {{ party_id: 1, room_scope: "s", payload_b64: {b64_mpkey!r} }} }},
-              ),
+              () => beforeHook({{ name: "multiplayer_board_post", input: {{ party_id: 1, room_scope: "s", payload_b64: {b64_mpkey!r} }} }}),
               /recovery_file/,
             );
             await assert.rejects(
-              () => hooks["tool.execute.before"](
-                {{ tool: "multiplayer_party_send" }},
-                {{ args: {{ party_id: 1, body: "join https://clank.party/i/42#SECRETFRAG99" }} }},
-              ),
+              () => beforeHook({{ name: "multiplayer_party_send", input: {{ party_id: 1, body: "join https://clank.party/i/42#SECRETFRAG99" }} }}),
               /invite_url_fragment/,
             );
             // Deeply nested object (>8) fails closed instead of silent pass
             let deep = {{ leaf: "ok" }};
             for (let i = 0; i < 10; i++) deep = {{ nested: deep }};
             await assert.rejects(
-              () => hooks["tool.execute.before"]({{ tool: "multiplayer_party_send" }}, {{ args: deep }}),
+              () => beforeHook({{ name: "multiplayer_party_send", input: deep }}),
               /nesting_depth_exceeded/,
             );
 
             // party_join.target allows #fragment URL over MCP stdio, and clean calls pass
-            await hooks["tool.execute.before"](
-              {{ tool: "multiplayer_party_join" }},
-              {{ args: {{ target: "https://clank.party/i/42#SECRETFRAG99" }} }},
-            );
-            await hooks["tool.execute.before"]({{ tool: "multiplayer_party_send" }}, {{ args: {{ body: "hello" }} }});
-            await hooks["tool.execute.before"]({{ tool: "read_file" }}, {{ args: {{ path: "README.md" }} }});
-            await hooks.event({{ event: {{ type: "session.created" }} }});
-            assert.ok(logs.length >= 2);
+            await beforeHook({{ name: "multiplayer_party_join", input: {{ target: "https://clank.party/i/42#SECRETFRAG99" }} }});
+            await beforeHook({{ name: "multiplayer_party_send", input: {{ body: "hello" }} }});
+            await beforeHook({{ name: "read_file", input: {{ path: "README.md" }} }});
             console.log("OPENCODE_OK");
             """
         )
@@ -468,13 +493,17 @@ class TestMultiHostPlugins(unittest.TestCase):
                   on(ev, fn) {{ events.set(ev, fn); }},
                 }});
 
-                assert.equal(tools.size, 17, "Pi extension must register all 17 LLM tools");
+                assert.equal(tools.size, 18, "Pi extension must register all 18 LLM tools");
                 assert.equal(Object.hasOwn(tools.get("inbox_read").parameters.properties, "ack"), false);
+                assert.ok(tools.has("party_listen"), "Pi must register party_listen");
+                assert.ok(events.has("before_agent_start"), "Pi must register before_agent_start guidance hook");
+                const startPatch = await events.get("before_agent_start")({{ systemPrompt: "base" }});
+                assert.ok(startPatch.systemPrompt.includes("is_browser=true"));
                 for (const cmd of ["party-status", "party-invite", "party-join", "party-leave", "friend-add", "friends", "party", "party-say", "party-card", "party-inbox"]) {{
                   assert.ok(commands.has(cmd), "missing Pi command: " + cmd);
                 }}
 
-                // Real Pi session_start(event, ctx) uses ctx.ui.notify + ctx.ui.setStatus
+                // Real Pi session_start(event, ctx) uses ctx.ui.notify + ctx.ui.setStatus + active_party_room_code
                 const notifications = [];
                 const statuses = [];
                 const uiCtx = {{
@@ -484,8 +513,8 @@ class TestMultiHostPlugins(unittest.TestCase):
                   }},
                 }};
                 await events.get("session_start")({{ reason: "startup" }}, uiCtx);
-                assert.ok(statuses.some(([k, v]) => k === "multiplayer" && v.includes("#77")));
-                assert.ok(notifications.some(([, m]) => m.includes("party #77")));
+                assert.ok(statuses.some(([k, v]) => k === "multiplayer" && v.includes("#77") && v.includes("K9F2")));
+                assert.ok(notifications.some(([, m]) => m.includes("party #77") && m.includes("K9F2")));
 
                 // tool_call hook refuses secrets and #fragment URLs
                 const res = await events.get("tool_call")({{
@@ -616,9 +645,20 @@ class TestMultiHostPlugins(unittest.TestCase):
             else:
                 self.assertEqual(out, {}, msg=raw_in[:80])
 
-        # 2. Antigravity hook: deny on secrets/malformed/depth>8; "ask" (NEVER "allow"!) on clean
+        # 2. Antigravity hook: deny on secrets/malformed/depth>8 (including lazy call_mcp_tool); "ask" on clean
+        agy_hooks_cfg = json.loads(
+            (REPO_ROOT / ".agents" / "plugins" / "multiplayer" / "hooks.json").read_text(encoding="utf-8")
+        )
+        agy_matcher_re = re.compile(agy_hooks_cfg["multiplayer-secret-guard"]["PreToolUse"][0]["matcher"])
+        self.assertIsNotNone(agy_matcher_re.search("call_mcp_tool"))
+        self.assertIsNotNone(agy_matcher_re.search("mcp_multiplayer_party_send"))
+
         agy_cases: list[tuple[str, str]] = [
             (json.dumps({"toolCall": {"name": "mcp_multiplayer_party_send", "args": {"body": f"leak {secret_tok}"}}}), "deny"),
+            (json.dumps({"toolCall": {"name": "call_mcp_tool", "args": {"ServerName": "multiplayer_multiplayer", "ToolName": "party_send", "Arguments": {"body": f"leak {secret_tok}"}}}}), "deny"),
+            (json.dumps({"toolCall": {"name": "call_mcp_tool", "args": {"ServerName": "multiplayer_multiplayer", "ToolName": "party_send", "Arguments": {"body": "join https://clank.party/i/1#MYSECRETFRAG"}}}}), "deny"),
+            (json.dumps({"toolCall": {"name": "call_mcp_tool", "args": {"ServerName": "multiplayer_multiplayer", "ToolName": "party_join", "Arguments": {"target": "https://clank.party/i/1#MYSECRETFRAG"}}}}), "ask"),
+            (json.dumps({"toolCall": {"name": "call_mcp_tool", "args": {"ServerName": "linear", "ToolName": "create_issue", "Arguments": {"description": "https://clank.party/i/1#MYSECRETFRAG"}}}}), "ask"),
             (json.dumps({"toolCall": {"name": "mcp_multiplayer_inbox_send", "args": {"body": f"rk {synth_rk}"}}}), "deny"),
             (json.dumps({"toolCall": {"name": "mcp_multiplayer_board_post", "args": {"payload_b64": b64_secret}}}), "deny"),
             (json.dumps({"toolCall": {"name": "mcp_multiplayer_party_send", "args": {"body": "join https://clank.party/i/1#MYSECRETFRAG"}}}), "deny"),
@@ -677,6 +717,41 @@ class TestMultiHostPlugins(unittest.TestCase):
         self.assertIs(ctx.cli_fn, hermes._cli_entrypoint)
         self.assertIsNone(registered_hooks["pre_llm_call"]())  # disabled unless env opted in
         self.assertIn("party-chat", registered_cmds)
+        self.assertIn("party-listen", registered_cmds)
+
+        # 4. P0/P1 Hermes regressions: #fragment refused on detect_secret_kind & join argv;
+        #    UnreadNotificationHook seeds from head even with explicit party_id & recovers on 4040.
+        self.assertEqual(
+            hermes.detect_secret_kind("join https://clank.party/i/42#SUPERSECRET12345"),
+            "invite_url_fragment",
+        )
+        self.assertEqual(
+            redact_url_fragments("https://staging.example.com/p/i/42#SUPERSECRET"),
+            "https://staging.example.com/p/i/42#[REDACTED]",
+        )
+        code, msg = hermes.handle_cli_command(
+            SimpleNamespace(action="join", target="https://clank.party/i/42#SECRET99", json=False)
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("#fragment", msg)
+
+        calls: list[list[str]] = []
+
+        def fake_runner(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+            calls.append(argv)
+            if argv[-2:] == ["party", "list"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"daemon_epoch": 9, "parties": [{"party_id": 42, "next_seq": 15}]}), ""
+                )
+            if "read" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "daemon error (code=4040): party 42 is not active")
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        hook = hermes.UnreadNotificationHook(party_id=42, seed_from_head=True, runner=fake_runner, enabled=True)
+        self.assertIsNone(hook())  # seeds from head (next_seq=15) without replaying history!
+        self.assertEqual(hook.cursor.after_seq, 15)
+        self.assertIsNone(hook())  # hits 4040 -> resets cursor for re-discovery instead of stalling forever
+        self.assertIsNone(hook.cursor)
 
     def test_detached_phux_party_chat_launchers_across_all_hosts(self) -> None:
         """Verify detached phux window creation, reuse, stale cleanup, and secret refusal across all hosts."""
@@ -695,12 +770,13 @@ class TestMultiHostPlugins(unittest.TestCase):
                     state = json.loads(state_path.read_text(encoding="utf-8"))
                     args = sys.argv[1:]
                     if args == ["ls", "--json"]:
-                        print(json.dumps({{"schema_version": 4, "sessions": state["sessions"]}}))
+                        host_sessions = [{{"name": s["name"], "active_terminal": "@42"}} for s in state["sessions"] if s.get("exec", {{}}).get("running", 0) > 0]
+                        print(json.dumps({{"schema_version": 4, "sessions": state["sessions"], "hosts": [{{"local": True, "sessions": host_sessions}}]}}))
                     elif len(args) >= 5 and args[:3] == ["new", "--json", "-s"] and "--" in args:
                         sess = args[3]
                         state["sessions"].append({{"name": sess, "exec": {{"running": 1, "starting": 0}}}})
                         state_path.write_text(json.dumps(state), encoding="utf-8")
-                        print(json.dumps({{"session": sess, "terminal": "@42", "argv": args}}))
+                        print(json.dumps({{"schema_version": 1, "session": sess, "terminal_id": 42, "argv": args}}))
                     elif args[:2] == ["kill", "--yes"]:
                         sess = args[2]
                         state["sessions"] = [s for s in state["sessions"] if s["name"] != sess]
@@ -729,6 +805,8 @@ class TestMultiHostPlugins(unittest.TestCase):
             res2 = hermes_launch(phux_binary=str(fake_phux))
             self.assertTrue(res2["ok"])
             self.assertTrue(res2["reused"])
+            self.assertEqual(res2["pane_id"], "@42")
+            self.assertEqual(res2["native_cmd"], "phux native attach @42")
 
             with self.assertRaises(ValueError):
                 hermes_launch(target="https://clank.party/i/1#SECRETFRAG", phux_binary=str(fake_phux))
@@ -781,19 +859,20 @@ class TestMultiHostPlugins(unittest.TestCase):
                 const ocOut = await ocCmds.get("party-chat").handler({{ args: "" }});
                 assert.ok(ocOut.text.includes("already running") && ocOut.text.includes("phux attach multiplayer-chat"));
 
-                // OpenCode TUI plugin registers ctrl+shift+p, palette, /party-chat, and fires toast
+                // OpenCode TUI plugin registers global ctrl+alt+m, palette, /party-chat, and fires toast
                 const layers = [];
                 const toasts = [];
                 opencodeTui.setup({{
                   keymap: {{ layer(factory) {{ layers.push(factory()); }} }},
                   ui: {{ toast: {{ show(t) {{ toasts.push(t); }} }} }},
                 }});
+                assert.equal(layers[0].mode, "global");
                 const chatCmd = layers[0].commands.find((c) => c.id === "multiplayer.chat");
-                assert.equal(chatCmd.bind, "ctrl+shift+p");
+                assert.equal(chatCmd.bind, "ctrl+alt+m");
                 assert.equal(chatCmd.palette, true);
                 assert.equal(chatCmd.slash.name, "party-chat");
                 await chatCmd.run("");
-                assert.ok(toasts.some((t) => t.variant === "success" && t.message.includes("phux attach multiplayer-chat")));
+                assert.ok(toasts.some((t) => t.variant === "success" && t.message.includes("phux attach multiplayer-chat") && t.message.includes("@42")));
 
                 console.log("ALL_PHUX_LAUNCHERS_OK");
                 """

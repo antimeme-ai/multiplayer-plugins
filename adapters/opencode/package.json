@@ -1,12 +1,13 @@
 {
   "name": "@antimeme-ai/opencode-multiplayer",
-  "version": "0.7.0",
-  "description": "OpenCode plugin wiring mp-outpost local MCP server (17 mp2 party & async E2EE inbox tools) with pre-exec secret refusal and provenance hooks for multiplayer.tech.",
+  "version": "0.7.1",
+  "description": "OpenCode v2 plugin wiring mp-outpost local MCP server (18 mp2 party, listen & async E2EE inbox tools) with pre-exec secret refusal and TUI party-chat launcher for multiplayer.tech.",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./server": "./src/index.ts",
     "./tui": "./src/tui.ts"
   },
   "files": [
@@ -20,6 +21,6 @@
   },
   "homepage": "https://multiplayer.tech",
   "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode/plugin": "*"
   }
 }

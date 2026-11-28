@@ -1,9 +1,16 @@
 /**
- * OpenCode native plugin for multiplayer.tech (`mp-outpost` v0.7.0).
+ * OpenCode v2 server plugin (`@opencode/plugin` contract) for multiplayer.tech (`mp-outpost` v0.7.1).
  *
- * IMPORTANT: OpenCode's plugin loader iterates all module exports and invokes each
- * export as a plugin initializer. This entry module therefore exports ONLY
- * `MultiplayerPlugin` (named + default); helper utilities live in `./security.ts`.
+ * Exports a default OpenCode v2 plugin definition `{ id, setup(ctx) }` that:
+ * - Registers the local `mp-outpost mcp` server via `ctx.mcp.transform(...)` without
+ *   overwriting user customization.
+ * - Enforces pre-exec secret refusal on all Multiplayer MCP tool calls via
+ *   `ctx.tool.hook("tool.before", ...)`.
+ * - Injects untrusted-peer provenance and secret-boundary guidance into session context
+ *   when `ctx.session?.hook` is available.
+ *
+ * Zero `console.*` calls and zero external runtime dependencies. Helper utilities live
+ * in `./security.ts`.
  */
 
 import {
@@ -14,111 +21,95 @@ import {
   type OpenCodeMcpLocalConfig,
 } from "./security.ts";
 
-export interface OpenCodeConfig {
-  mcp?: Record<string, OpenCodeMcpLocalConfig | Record<string, unknown>>;
-  [key: string]: unknown;
+export interface OpenCodeMcpRegistry {
+  list?: () => Iterable<[string, OpenCodeMcpLocalConfig | Record<string, unknown>]>;
+  get?: (id: string) => (OpenCodeMcpLocalConfig | Record<string, unknown>) | undefined;
+  add?: (id: string, config: OpenCodeMcpLocalConfig) => void;
+  set?: (id: string, config: OpenCodeMcpLocalConfig) => void;
 }
 
-export interface OpenCodeLogEntry {
-  service: string;
-  level: "debug" | "info" | "warn" | "error";
-  message: string;
-  extra?: Record<string, unknown>;
+export interface OpenCodeToolBeforeEvent {
+  name?: string;
+  tool?: string;
+  input?: unknown;
+  args?: unknown;
 }
 
-export interface OpenCodePluginContext {
-  client?: {
-    app?: {
-      log?: (entry: { body: OpenCodeLogEntry }) => Promise<void> | void;
-    };
+export interface OpenCodeSessionContextEvent {
+  system?: Array<{ text?: string; [key: string]: unknown } | string>;
+}
+
+export interface OpenCodeV2ServerContext {
+  mcp?: {
+    transform?: (fn: (registry: OpenCodeMcpRegistry) => void) => Promise<void> | void;
+  };
+  tool?: {
+    hook?: (
+      event: "tool.before" | "tool.after",
+      handler: (ev: OpenCodeToolBeforeEvent) => Promise<void> | void,
+    ) => Promise<void> | void;
+  };
+  session?: {
+    hook?: (
+      event: string,
+      handler: (ev: OpenCodeSessionContextEvent) => Promise<void> | void,
+    ) => Promise<void> | void;
   };
 }
 
-export interface OpenCodeHooks {
-  config?: (cfg: OpenCodeConfig) => Promise<void> | void;
-  event?: (payload: { event?: { type?: string } }) => Promise<void> | void;
-  "tool.execute.before"?: (
-    input: { tool: string; sessionID?: string; callID?: string },
-    output: { args: unknown },
-  ) => Promise<void> | void;
-  "experimental.chat.system.transform"?: (
-    input: { sessionID?: string; model?: unknown },
-    output: { system: string[] },
-  ) => Promise<void> | void;
-}
+const serverPlugin = {
+  id: "antimeme-ai.multiplayer",
+  async setup(ctx: OpenCodeV2ServerContext): Promise<void> {
+    const mcpNamespace = "multiplayer";
 
-export async function MultiplayerPlugin(
-  ctx: OpenCodePluginContext,
-): Promise<OpenCodeHooks> {
-  let mcpNamespace = "multiplayer";
-
-  const log = async (
-    level: OpenCodeLogEntry["level"],
-    message: string,
-    extra?: Record<string, unknown>,
-  ): Promise<void> => {
-    try {
-      await ctx.client?.app?.log?.({
-        body: {
-          service: "multiplayer-outpost",
-          level,
-          message,
-          ...(extra ? { extra } : {}),
-        },
+    if (typeof ctx?.mcp?.transform === "function") {
+      await ctx.mcp.transform((registry) => {
+        const existing =
+          typeof registry.get === "function"
+            ? registry.get(mcpNamespace)
+            : typeof registry.list === "function"
+              ? [...registry.list()].find(([name]) => name === mcpNamespace)?.[1]
+              : undefined;
+        if (existing) return;
+        const entry: OpenCodeMcpLocalConfig = { ...MULTIPLAYER_MCP_CONFIG };
+        if (typeof registry.set === "function") {
+          registry.set(mcpNamespace, entry);
+        } else if (typeof registry.add === "function") {
+          registry.add(mcpNamespace, entry);
+        }
       });
-    } catch {
-      // Never write to stdout/stderr inside OpenCode's TUI process.
     }
-  };
 
-  return {
-    async config(cfg: OpenCodeConfig): Promise<void> {
-      if (!cfg.mcp) {
-        cfg.mcp = {};
-      }
-      if (!cfg.mcp[mcpNamespace]) {
-        cfg.mcp[mcpNamespace] = { ...MULTIPLAYER_MCP_CONFIG };
-        await log("info", "Registered local mp-outpost MCP server as 'multiplayer' (17 tools).");
-      }
-    },
+    if (typeof ctx?.tool?.hook === "function") {
+      await ctx.tool.hook("tool.before", async (ev) => {
+        const toolName = String(ev?.name ?? ev?.tool ?? "");
+        if (!toolName || !isMultiplayerToolName(toolName, mcpNamespace)) {
+          return;
+        }
+        const payload = ev?.input !== undefined ? ev.input : ev?.args;
+        const secretKind = scanValueForSecrets(payload, { toolName });
+        if (secretKind !== null) {
+          throw new Error(
+            `Refused ${toolName}: detected forbidden multiplayer secret material (${secretKind}).`,
+          );
+        }
+      });
+    }
 
-    async event({ event }: { event?: { type?: string } }): Promise<void> {
-      if (event?.type === "session.created") {
-        await log(
-          "debug",
-          "Multiplayer Outpost ready; call outpost_status, party_invite, party_join, or party_post_card to collaborate in mp2 rooms.",
+    if (typeof ctx?.session?.hook === "function") {
+      await ctx.session.hook("context", (ev) => {
+        if (!Array.isArray(ev?.system)) return;
+        const already = ev.system.some((item) =>
+          typeof item === "string"
+            ? item === MULTIPLAYER_SYSTEM_GUIDANCE
+            : item?.text === MULTIPLAYER_SYSTEM_GUIDANCE,
         );
-      }
-    },
+        if (!already) {
+          ev.system.push({ text: MULTIPLAYER_SYSTEM_GUIDANCE });
+        }
+      });
+    }
+  },
+};
 
-    async "tool.execute.before"(
-      input: { tool: string; sessionID?: string; callID?: string },
-      output: { args: unknown },
-    ): Promise<void> {
-      if (!input?.tool || !isMultiplayerToolName(input.tool, mcpNamespace)) {
-        return;
-      }
-      const secretKind = scanValueForSecrets(output?.args, { toolName: input.tool });
-      if (secretKind !== null) {
-        await log("warn", "Refused outbound multiplayer tool call containing forbidden secret material.", {
-          tool: input.tool,
-          secretKind,
-        });
-        throw new Error(
-          `Refused ${input.tool}: detected forbidden multiplayer secret material (${secretKind}).`,
-        );
-      }
-    },
-
-    async "experimental.chat.system.transform"(
-      _input: { sessionID?: string; model?: unknown },
-      output: { system: string[] },
-    ): Promise<void> {
-      if (Array.isArray(output?.system) && !output.system.includes(MULTIPLAYER_SYSTEM_GUIDANCE)) {
-        output.system.push(MULTIPLAYER_SYSTEM_GUIDANCE);
-      }
-    },
-  };
-}
-
-export default MultiplayerPlugin;
+export default serverPlugin;

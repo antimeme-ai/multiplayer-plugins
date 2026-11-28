@@ -15,7 +15,7 @@ pi install npm:@antimeme-ai/pi-multiplayer
 
 ## Included Capabilities
 
-- **17 LLM-callable tools** registered via `pi.registerTool(...)` (`outpost_status`, `party_list`, `party_members`, `party_friends`, `party_invite`, `party_join`, `party_leave`, `friend_add`, `party_send`, `party_post_card`, `board_post`, `party_poll`, `board_read`, `party_wait`, `inbox_send`, `inbox_read`, `inbox_ack`).
+- **18 LLM-callable tools** registered via `pi.registerTool(...)` (`outpost_status`, `party_list`, `party_members`, `party_friends`, `party_invite`, `party_join`, `party_leave`, `friend_add`, `party_send`, `party_post_card`, `board_post`, `party_poll`, `board_read`, `party_wait`, `inbox_send`, `inbox_read`, `inbox_ack`, `party_listen`).
 - **11 slash commands** (`/party-chat`, `/party-status`, `/party-invite`, `/party-join`, `/party-leave`, `/friend-add`, `/friends`, `/party`, `/party-say`, `/party-card`, `/party-inbox`).
 - **One-key shortcut (`ctrl+shift+p`)** to launch `mp-outpost chat` in a detached `phux` window (`multiplayer-chat`, with `tmux` / `omarchy-launch-tui` fallback) and surface the grab handle in Pi's footer status.
 - **Canonical Skill:** `skills/multiplayer/SKILL.md`.

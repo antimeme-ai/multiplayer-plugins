@@ -1,9 +1,43 @@
 "use strict";
 
 const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const vscode = require("vscode");
 
 const SAFE_SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function resolveBinaryPath(binary) {
+  if (!binary || binary.includes("/") || binary.includes("\\")) return binary;
+  const searchDirs = [
+    ...(process.env.PATH ? process.env.PATH.split(path.delimiter) : []),
+    path.join(os.homedir(), ".local", "bin"),
+    path.join(os.homedir(), ".cargo", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+  for (const dir of searchDirs) {
+    if (!dir) continue;
+    const cand = path.join(dir, binary);
+    try {
+      fs.accessSync(cand, fs.constants.X_OK);
+      if (fs.statSync(cand).isFile()) return cand;
+    } catch {}
+  }
+  return binary;
+}
+
+function formatTerminalAddress(val) {
+  if (typeof val === "number" && Number.isInteger(val) && val > 0) return `@${val}`;
+  if (typeof val === "string") {
+    const cleaned = val.trim();
+    if (!cleaned) return null;
+    if (/^\d+$/.test(cleaned)) return `@${cleaned}`;
+    return cleaned;
+  }
+  return null;
+}
 
 function execCapture(binary, args, timeoutMs = 10000) {
   return new Promise((resolve) => {
@@ -42,12 +76,30 @@ function execCapture(binary, args, timeoutMs = 10000) {
 
 function extractPaneId(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  if ("terminal_id" in payload) {
+    const addr = formatTerminalAddress(payload.terminal_id);
+    if (addr) return addr;
+  }
   for (const k of ["terminal", "pane", "pane_id", "id"]) {
-    if (typeof payload[k] === "string" && payload[k].trim()) return payload[k].trim();
+    const addr = formatTerminalAddress(payload[k]);
+    if (addr) return addr;
   }
   for (const k of ["pane", "terminal", "seed", "result"]) {
     const nested = extractPaneId(payload[k]);
     if (nested) return nested;
+  }
+  return null;
+}
+
+function extractActiveTerminal(lsData, session) {
+  if (!lsData || typeof lsData !== "object" || !Array.isArray(lsData.hosts)) return null;
+  for (const host of lsData.hosts) {
+    if (!host || !Array.isArray(host.sessions)) continue;
+    const found = host.sessions.find((s) => s && s.name === session);
+    if (found) {
+      const addr = formatTerminalAddress(found.active_terminal);
+      if (addr) return addr;
+    }
   }
   return null;
 }
@@ -60,7 +112,7 @@ function openOrFocusChatTerminal(outpostBinary) {
   }
   const term = vscode.window.createTerminal({
     name: "Multiplayer Party Chat",
-    shellPath: outpostBinary,
+    shellPath: resolveBinaryPath(outpostBinary),
     shellArgs: ["chat"],
   });
   term.show(false);
@@ -69,20 +121,23 @@ function openOrFocusChatTerminal(outpostBinary) {
 
 async function openDetachedPhuxWindow(outpostBinary, sessionName) {
   const session = SAFE_SESSION_RE.test(sessionName) ? sessionName : "multiplayer-chat";
-  const lsRes = await execCapture("phux", ["ls", "--json"]);
+  const phuxBin = resolveBinaryPath("phux");
+  const resolvedOutpost = resolveBinaryPath(outpostBinary);
+  const lsRes = await execCapture(phuxBin, ["ls", "--json"]);
   if (lsRes.notFound) {
     const choice = await vscode.window.showWarningMessage(
       "phux was not found on PATH. Open Multiplayer Party Chat in the integrated terminal instead?",
       "Open Integrated Terminal",
     );
     if (choice === "Open Integrated Terminal") {
-      openOrFocusChatTerminal(outpostBinary);
+      openOrFocusChatTerminal(resolvedOutpost);
     }
     return;
   }
 
   let existingFound = false;
   let existingRunning = false;
+  let paneId = null;
   if (lsRes.code === 0 && lsRes.stdout) {
     try {
       const parsed = JSON.parse(lsRes.stdout);
@@ -90,18 +145,23 @@ async function openDetachedPhuxWindow(outpostBinary, sessionName) {
       if (found) {
         existingFound = true;
         existingRunning = Number(found.exec?.running ?? 0) + Number(found.exec?.starting ?? 0) > 0;
+        if (existingRunning) {
+          paneId = extractActiveTerminal(parsed, session);
+        }
       }
     } catch {}
   }
 
-  let paneId = null;
   if (!existingRunning) {
     if (existingFound) {
-      await execCapture("phux", ["kill", "--yes", session]);
+      await execCapture(phuxBin, ["kill", "--yes", session]);
     }
-    const created = await execCapture("phux", ["new", "--json", "-s", session, "--", outpostBinary, "chat"], 15000);
+    const created = await execCapture(phuxBin, ["new", "--json", "-s", session, "--", resolvedOutpost, "chat"], 15000);
     if (created.code !== 0) {
-      vscode.window.showErrorMessage(`Failed to start detached phux session '${session}': ${created.stderr || created.code}`);
+      if ((created.stdout || "").includes("spawn_failed") || (created.stderr || "").includes("spawn_failed")) {
+        await execCapture(phuxBin, ["kill", "--yes", session]);
+      }
+      vscode.window.showErrorMessage(`Failed to start detached phux session '${session}': ${created.stderr || created.stdout || created.code}`);
       return;
     }
     if (created.stdout) {
@@ -112,24 +172,29 @@ async function openDetachedPhuxWindow(outpostBinary, sessionName) {
   }
 
   const attachCmd = `phux attach ${session}`;
-  const nativeTarget = paneId || `${session}:0.0`;
+  const nativeCmd = paneId ? `phux native attach ${paneId}` : null;
+  const actions = ["Attach in Terminal", "Copy phux attach", ...(nativeCmd ? ["Copy phux native"] : [])];
   const choice = await vscode.window.showInformationMessage(
-    `Multiplayer Party Chat is running in detached phux session '${session}'.`,
-    "Attach in Terminal",
-    "Copy phux attach",
-    "Copy phux native",
+    `Multiplayer Party Chat is running in detached phux session '${session}'${paneId ? ` (${paneId})` : ""}.`,
+    ...actions,
   );
   if (choice === "Attach in Terminal") {
-    const term = vscode.window.createTerminal({
-      name: `phux: ${session}`,
-      shellPath: "phux",
-      shellArgs: ["attach", session],
-    });
-    term.show(false);
+    const termName = `phux: ${session}`;
+    const existingTerm = vscode.window.terminals.find((t) => t.name === termName);
+    if (existingTerm) {
+      existingTerm.show(false);
+    } else {
+      const term = vscode.window.createTerminal({
+        name: termName,
+        shellPath: phuxBin,
+        shellArgs: ["attach", session],
+      });
+      term.show(false);
+    }
   } else if (choice === "Copy phux attach") {
     await vscode.env.clipboard.writeText(attachCmd);
-  } else if (choice === "Copy phux native") {
-    await vscode.env.clipboard.writeText(`phux native attach ${nativeTarget}`);
+  } else if (choice === "Copy phux native" && nativeCmd) {
+    await vscode.env.clipboard.writeText(nativeCmd);
   }
 }
 

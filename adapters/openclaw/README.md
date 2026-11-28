@@ -34,9 +34,9 @@ Restart the OpenClaw Gateway, then optionally allow outbound write tools in `~/.
 
 ## Capabilities
 
-- **17 Agent Tools** (`outpost_status`, `party_list`, `party_members`, `party_friends`, `party_poll`, `board_read`, `party_wait`, `inbox_read`, plus opt-in write tools `party_invite`, `party_join`, `party_leave`, `friend_add`, `party_send`, `party_post_card`, `board_post`, `inbox_send`, `inbox_ack`).
-- **Auto-Reply Slash Commands:** `/party-status`, `/party-invite`, `/party-join`, `/party-leave`, `/party-friends`, `/party-read` (`requireAuth: true`).
-- **CLI Subcommand:** `openclaw multiplayer {status, doctor, friends, parties, inbox, policy}`.
+- **18 Agent Tools** (`outpost_status`, `party_list`, `party_members`, `party_friends`, `party_poll`, `board_read`, `party_wait`, `inbox_read`, plus opt-in write tools `party_invite`, `party_join`, `party_leave`, `friend_add`, `party_send`, `party_post_card`, `board_post`, `inbox_send`, `inbox_ack`, `party_listen`).
+- **Auto-Reply Slash Commands:** `/party-status`, `/party-chat`, `/party-invite`, `/party-join`, `/party-leave`, `/party-friends`, `/party-read` (`requireAuth: true`).
+- **CLI Subcommand:** `openclaw multiplayer {status, chat, listen, doctor, friends, parties, inbox, policy}`.
 - **Security Hooks:** `before_prompt_build` injects untrusted-peer provenance and `is_browser` containment guidance; `before_tool_call` refuses forbidden secrets (`mpinv1_`, `mppi1_`, `mpcs1_`, `mpguest1_`, `mprk1_`, `mpdl1_`, `.mpkey`, `device_secret`, `device_cwt`, PEM private keys) before any `mp-outpost` subprocess spawns.
 - **Bundled Skill:** Ships `skills/multiplayer/SKILL.md` (byte-identical to canonical `skills/multiplayer/SKILL.md`).
 - **Zero external runtime dependencies:** Pure Node built-ins + TypeScript loaded via OpenClaw `jiti` (safe under `npm install --ignore-scripts`).

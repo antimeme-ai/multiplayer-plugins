@@ -244,7 +244,20 @@ def main() -> int:
             return _deny("Refused outbound multiplayer tool call: missing toolCall object (fail closed).")
         tool_name = str(tool_call.get("name") or "")
         args = tool_call.get("args")
-        secret_kind = scan_value(args, tool_name=tool_name)
+        effective_tool_name = tool_name
+        scan_target: Any = args
+        # Antigravity loads plugin MCP tools lazily via `call_mcp_tool(ServerName, ToolName, Arguments)`.
+        if tool_name in ("call_mcp_tool", "mcp_tool"):
+            if not isinstance(args, dict):
+                return _deny("Refused MCP tool call: malformed call_mcp_tool args (fail closed).")
+            server_name = str(args.get("ServerName") or args.get("serverName") or args.get("server_name") or "")
+            if "multiplayer" not in server_name.lower():
+                # Unrelated MCP server: defer to Antigravity's normal permission policy.
+                print('{"decision": "ask"}')
+                return 0
+            effective_tool_name = str(args.get("ToolName") or args.get("toolName") or args.get("tool_name") or "")
+            scan_target = args.get("Arguments") if "Arguments" in args else args.get("arguments", args)
+        secret_kind = scan_value(scan_target, tool_name=effective_tool_name)
         if secret_kind is not None:
             return _deny(
                 f"Refused outbound multiplayer tool call: detected forbidden secret material ({secret_kind})."

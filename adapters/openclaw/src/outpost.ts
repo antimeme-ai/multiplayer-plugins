@@ -60,6 +60,16 @@ export async function runOutpostJson(
       } catch {
         // already exited
       }
+      const hardKill = setTimeout(() => {
+        try {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill("SIGKILL");
+          }
+        } catch {
+          // already exited
+        }
+      }, 2_000);
+      hardKill.unref?.();
     };
 
     const onAbort = (): void => {

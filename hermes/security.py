@@ -41,7 +41,11 @@ _DEVICE_CRED_RE: Final[re.Pattern[str]] = re.compile(
 )
 _ANGLE_RUN_RE: Final[re.Pattern[str]] = re.compile(r"<{3,}|>{3,}")
 _URL_FRAGMENT_RE: Final[re.Pattern[str]] = re.compile(
-    r"((?:https?://)?(?:clank\.party|multiplayer\.tech|mp\.gg)/[^\s#\"']+?)#[A-Za-z0-9_-]+",
+    r"((?:https?://)?(?:(?:www\.)?(?:clank\.party|multiplayer\.tech|mp\.gg)/[^\s#\"']+?|[^\s#\"']+?/(?:p/)?i/[A-Za-z0-9_-]+))#[A-Za-z0-9_-]+",
+    re.IGNORECASE,
+)
+_INVITE_FRAGMENT_TEST_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:https?://)?(?:(?:www\.)?(?:clank\.party|multiplayer\.tech|mp\.gg)/[^\s#\"']+|[^\s#\"']+/(?:p/)?i/[A-Za-z0-9_-]+)#[^\s]{8,}",
     re.IGNORECASE,
 )
 
@@ -82,8 +86,19 @@ class SecretRefusalError(ValueError):
 
 
 def redact_url_fragments(text: str) -> str:
-    """Redact `#fragment` invite secrets on multiplayer.tech / clank.party / mp.gg URLs."""
+    """Redact `#fragment` invite secrets on multiplayer.tech / clank.party / mp.gg and /i/ URLs."""
     return _URL_FRAGMENT_RE.sub(r"\1#[REDACTED]", text)
+
+
+def redact_payload(value: object) -> object:
+    """Recursively redact `#fragment` invite secrets from JSON-like return payloads."""
+    if isinstance(value, str):
+        return redact_url_fragments(value)
+    if isinstance(value, list):
+        return [redact_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {k: redact_payload(v) for k, v in value.items()}
+    return value
 
 
 def sanitize_peer_text(raw: str) -> str:
@@ -277,6 +292,8 @@ def detect_secret_kind(payload: str | bytes) -> str | None:
             return "recovery_file"
         if _DEVICE_CRED_RE.search(candidate):
             return "device_credential"
+        if _INVITE_FRAGMENT_TEST_RE.search(candidate):
+            return "invite_url_fragment"
     if _contains_recovery_key(norm):
         return "recovery_key"
     return None

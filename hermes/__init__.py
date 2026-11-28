@@ -61,6 +61,7 @@ MIN_PARTY_WAIT_TOOL_TIMEOUT_S: Final[int] = 60
 CLI_ACTIONS: Final[tuple[str, ...]] = (
     "login",
     "chat",
+    "listen",
     "add",
     "invite",
     "join",
@@ -270,11 +271,13 @@ def _format_unread_context(
     parts = [header]
     for item in fenced_items:
         origin = " origin=browser" if item.get("is_browser") else ""
+        dev_id = item.get("sender_device_id")
+        device_tag = f" device={dev_id}" if isinstance(dev_id, int) and dev_id > 0 else ""
         safe_handle = sanitize_single_line(str(item.get("sender_handle", "")))
         safe_kind = sanitize_single_line(str(item.get("kind", "unknown")))
         meta = (
             f"[seq={item['event_seq']} kind={safe_kind} "
-            f"from={safe_handle}({item['sender_account_id']}){origin}]"
+            f"from={safe_handle}({item['sender_account_id']}){device_tag}{origin}]"
         )
         parts.append(f"{meta}\n{item['fenced_body']}")
     return "\n\n".join(parts)
@@ -307,12 +310,14 @@ class UnreadNotificationHook:
         self.binary = binary
         self.state_dir = state_dir
         self.party_id = party_id
+        self._pinned_party = party_id is not None
         self.limit = max(1, min(int(limit), 100))
         self.timeout_s = max(0.1, float(timeout_s))
         self._runner = runner or _default_sync_runner
         self.enabled = bool(enabled)
         self.seed_from_head = bool(seed_from_head)
-        self.cursor: PartyCursor | None = PartyCursor(party_id=party_id) if party_id else None
+        self._seeded = not self.seed_from_head
+        self.cursor: PartyCursor | None = PartyCursor(party_id=party_id) if (party_id and not self.seed_from_head) else None
 
     def _argv(self, sub_args: list[str]) -> list[str]:
         base = [self.binary]
@@ -321,37 +326,41 @@ class UnreadNotificationHook:
         base.append("--json")
         return base + sub_args
 
-    def _run_json_quiet(self, sub_args: list[str]) -> dict[str, Any] | None:
+    def _run_json_quiet(self, sub_args: list[str]) -> tuple[dict[str, Any] | None, str]:
         try:
             proc = self._runner(self._argv(sub_args), self.timeout_s)
-        except (OSError, subprocess.SubprocessError):
-            return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, str(exc)
         if proc.returncode != 0 or not proc.stdout.strip():
-            return None
+            return None, (proc.stderr or proc.stdout or "").strip()
         try:
             parsed = json.loads(proc.stdout)
         except json.JSONDecodeError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
+            return None, "invalid json"
+        return (parsed if isinstance(parsed, dict) else None), ""
 
     def __call__(self, *_args: Any, **_kwargs: Any) -> dict[str, Any] | None:
         if not self.enabled:
             return None
         pid = self.cursor.party_id if self.cursor else self.party_id
-        if pid is None:
-            listed = self._run_json_quiet(["party", "list"])
+        if pid is None or (self.seed_from_head and not self._seeded):
+            listed, _ = self._run_json_quiet(["party", "list"])
             if not listed:
                 return None
             parties = listed.get("parties") or []
             if not parties:
                 return None
-            first_party = parties[0]
-            pid = int(first_party["party_id"])
+            chosen = None
+            if pid is not None:
+                chosen = next((p for p in parties if isinstance(p, dict) and p.get("party_id") == pid), None)
+            if chosen is None:
+                chosen = parties[0]
+            pid = int(chosen["party_id"])
             self.party_id = pid
             initial_seq = 0
             initial_epoch = int(listed.get("daemon_epoch", 0) or 0)
             if self.seed_from_head:
-                raw_next = first_party.get("next_seq")
+                raw_next = chosen.get("next_seq")
                 if isinstance(raw_next, int) and raw_next > 0:
                     initial_seq = raw_next
             self.cursor = PartyCursor(
@@ -359,6 +368,7 @@ class UnreadNotificationHook:
                 after_seq=initial_seq,
                 daemon_epoch=initial_epoch,
             )
+            self._seeded = True
             if self.seed_from_head and initial_seq > 0:
                 return None
         elif self.cursor is None:
@@ -376,8 +386,14 @@ class UnreadNotificationHook:
         if self.cursor.daemon_epoch > 0:
             poll_args.extend(["--cursor-epoch", str(self.cursor.daemon_epoch)])
 
-        resp = self._run_json_quiet(poll_args)
+        resp, err_text = self._run_json_quiet(poll_args)
         if not resp:
+            err_lower = err_text.lower()
+            if "is not active" in err_lower or "code=4040" in err_lower:
+                self.cursor = None
+                if not self._pinned_party:
+                    self.party_id = None
+                self._seeded = not self.seed_from_head
             return None
 
         new_epoch = int(resp.get("daemon_epoch", self.cursor.daemon_epoch))
@@ -404,6 +420,7 @@ class UnreadNotificationHook:
                     "event_seq": msg.provenance.event_seq,
                     "kind": msg.provenance.kind,
                     "sender_account_id": msg.provenance.sender_account_id,
+                    "sender_device_id": msg.provenance.sender_device_id,
                     "sender_handle": msg.provenance.sender_handle,
                     "safety_number": msg.provenance.safety_number,
                     "untrusted_remote": msg.provenance.untrusted_remote,
@@ -507,6 +524,18 @@ def handle_cli_command(
 
     if action == "status":
         sub_args = ["party", "status"]
+    elif action == "listen":
+        listen_action = (str(target_raw).strip().lower() if target_raw is not None and str(target_raw).strip() else "status")
+        if listen_action not in ("status", "profiles", "on", "off"):
+            return (2, "Usage: hermes multiplayer listen [status|profiles|on|off] [--name <profile>]")
+        sub_args = ["listen", listen_action]
+        profile_name = getattr(args, "name", None)
+        if profile_name is not None and str(profile_name).strip():
+            clean_prof, err = _validate_cli_arg("name", str(profile_name))
+            if err:
+                return (2, err)
+            assert clean_prof is not None
+            sub_args.extend(["--name", clean_prof])
     elif action == "doctor":
         sub_args = ["doctor"]
         if getattr(args, "trace", False):
@@ -558,6 +587,11 @@ def handle_cli_command(
     elif action == "join":
         sub_args = ["join"]
         if target_raw is not None and str(target_raw).strip():
+            if "#" in str(target_raw):
+                return (
+                    2,
+                    "Refused #fragment invite URL on CLI argv: redeem fragment links directly via `mp-outpost join` in your terminal.",
+                )
             clean_target, err = _validate_cli_arg("target", str(target_raw))
             if err:
                 return (2, err)
@@ -732,7 +766,7 @@ def _setup_cli_parser(subparser: Any) -> None:
         "target",
         nargs="?",
         default=None,
-        help="Optional target for add (@handle), invite (@handle), join (#fragment url|@handle|CODE), or leave (party_id).",
+        help="Optional target for add (@handle), invite (@handle), join (@handle|CODE|party_id), listen (status|profiles|on|off), or leave (party_id).",
     )
     subparser.add_argument("--name", default=None, help="Optional room name for invite.")
     subparser.add_argument("--agent-name", default=None, help="Optional agent display name for join.")
@@ -818,8 +852,9 @@ def register(ctx: Any) -> dict[str, Any]:
         slash_specs = (
             ("party-status", "status", "Show mp-outpost auth, encryption posture, and active party status", ""),
             ("party-chat", "chat", "Open mp-outpost party chat in a detached phux window (or --in-place)", "[--in-place] [target]"),
-            ("party-invite", "invite", "Open or reuse an mp2 party and optionally send an addressed invite to @handle", "[@handle]"),
-            ("party-join", "join", "Join a party by accepting latest invite, @handle, or #fragment invite URL", "[target]"),
+            ("party-listen", "listen", "Inspect or toggle opt-in mp-outpost listen profile (status|profiles|on|off)", "[status|profiles|on|off]"),
+            ("party-invite", "invite", "Open or reuse an mp2 party and optionally send an addressed invite to @handle", "[@handle] [--name <name>]"),
+            ("party-join", "join", "Join a party by accepting latest invite, @handle, room code, or numeric party ID", "[target] [--agent-name <name>]"),
             ("party-leave", "leave", "Leave the active multiplayer.tech party room", "[party_id]"),
             ("party-friends", "friends", "List multiplayer.tech friends, presence, and pending invites", ""),
             ("party-read", "read", "Read unread nonce-fenced party messages", "[party_id]"),

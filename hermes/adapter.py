@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, Final
 from .security import (
     SecretRefusalError,
     fence_peer_text,
+    redact_payload,
     redact_url_fragments,
     refuse_secrets,
     sanitize_peer_text,
@@ -25,7 +26,18 @@ MAX_PARTY_WAIT_MS: Final[int] = 45_000
 DEFAULT_PARTY_WAIT_MS: Final[int] = 25_000
 DEFAULT_SUBPROCESS_GRACE_S: Final[float] = 15.0
 MAX_SAFE_ID: Final[int] = (1 << 53) - 1
-_AMBIGUOUS_SAY_FLAGS: Final[frozenset[str]] = frozenset({"--scope", "--to-device"})
+_AMBIGUOUS_SAY_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "--scope",
+        "--to-device",
+        "--json",
+        "--debug",
+        "--strict-pins",
+        "--state-dir",
+        "--runtime-dir",
+        "--device-id",
+    }
+)
 
 
 class _StandaloneBasePlatformAdapter:
@@ -246,6 +258,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self.binary: str = binary or str(cfg.get("binary", "mp-outpost"))
         raw_party = party_id if party_id is not None else cfg.get("party_id")
         self.party_id: int | None = int(raw_party) if raw_party is not None else None
+        self._pinned_party_id: bool = self.party_id is not None
         self.state_dir: str | None = state_dir or cfg.get("state_dir")
         self.wait_timeout_ms: int = clamp_wait_timeout_ms(
             int(cfg.get("wait_timeout_ms", wait_timeout_ms))
@@ -258,6 +271,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self.max_consecutive_errors: int = max(
             1, int(cfg.get("max_consecutive_errors", max_consecutive_errors))
         )
+        self.idle_poll_s: float = max(0.05, float(cfg.get("idle_poll_s", 2.0)))
         self.backoff_s: float = max(0.0, float(cfg.get("backoff_s", backoff_s)))
 
         self.cursor: PartyCursor | None = (
@@ -383,7 +397,8 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
             args.append(_validate_safe_cli_token(handle, "handle"))
         if name is not None and name.strip():
             args.extend(["--name", _validate_safe_cli_token(name, "name")])
-        return await self._run_json(args, timeout_s=self.subprocess_grace_s)
+        raw = await self._run_json(args, timeout_s=self.subprocess_grace_s)
+        return redact_payload(raw)  # type: ignore[return-value]
 
     async def join(
         self,
@@ -391,13 +406,18 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         *,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        """Join an mp2 party by #fragment invite URL, @handle, room code, or accept latest invite."""
+        """Join an mp2 party by @handle, room code, numeric party ID, or accept latest invite."""
         args = ["join"]
         if target is not None and target.strip():
+            if "#" in target:
+                raise ValueError(
+                    "Refused #fragment invite URL on CLI argv: redeem fragment links directly via `mp-outpost join` in your terminal."
+                )
             args.append(_validate_safe_cli_token(target, "target"))
         if agent_name is not None and agent_name.strip():
             args.extend(["--agent-name", _validate_safe_cli_token(agent_name, "agent_name")])
-        return await self._run_json(args, timeout_s=self.subprocess_grace_s)
+        raw = await self._run_json(args, timeout_s=self.subprocess_grace_s)
+        return redact_payload(raw)  # type: ignore[return-value]
 
     async def leave(self, party_id: int | None = None) -> dict[str, Any]:
         """Leave the active party room (or an explicit ``party_id``)."""
@@ -418,16 +438,19 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         pid = _validate_safe_id(party_id, "party_id")
         if not isinstance(body, str) or not body:
             raise ValueError("body must be a non-empty string")
-        if not isinstance(room_scope, str) or not room_scope:
+        if not isinstance(room_scope, str) or not room_scope.strip():
             raise ValueError("room_scope must be a non-empty string")
+        clean_scope = room_scope.strip()
+        if clean_scope.startswith("-"):
+            raise ValueError("room_scope cannot start with '-'")
         if body.strip() in _AMBIGUOUS_SAY_FLAGS:
             raise ValueError("body cannot be a bare CLI option flag")
 
         # Fail closed BEFORE spawning any subprocess so secrets never enter argv.
         refuse_secrets(body)
-        refuse_secrets(room_scope)
+        refuse_secrets(clean_scope)
 
-        args = ["party", "say", str(pid), "--scope", room_scope]
+        args = ["party", "say", str(pid), "--scope", clean_scope]
         if target_device_id is not None:
             tdid = _validate_safe_id(target_device_id, "target_device_id")
             args.extend(["--to-device", str(tdid)])
@@ -539,10 +562,10 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """BasePlatformAdapter-compatible send method (`chat_id` is party_id string)."""
         _ = reply_to
         meta = metadata or {}
-        party_id = int(chat_id)
         room_scope = str(kwargs.get("room_scope", meta.get("room_scope", "party/main")))
         target_device_id = kwargs.get("target_device_id", meta.get("target_device_id"))
         try:
+            party_id = int(chat_id)
             result = await self.send_message(
                 party_id,
                 content,
@@ -681,7 +704,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
             listed = await self.list_parties()
             parties = listed.get("parties") or []
             if not parties:
-                return [], {"timed_out": True, "events": []}
+                return [], {"timed_out": True, "events": [], "no_active_party": True}
             pid = int(parties[0]["party_id"])
             self.party_id = pid
 
@@ -756,11 +779,19 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
             and _HermesMessageType is not None
             and getattr(self, "_message_handler", None) is not None
         ):
+            # Do not dispatch membership_changed notices as user chat prompts in Hermes Gateway.
+            if msg.provenance.kind == "membership_changed":
+                return
             origin = " origin=browser" if msg.provenance.is_browser else ""
+            device_tag = (
+                f" device={msg.provenance.sender_device_id}"
+                if msg.provenance.sender_device_id > 0
+                else ""
+            )
             meta = (
                 f"[party={msg.provenance.party_id} seq={msg.provenance.event_seq} "
                 f"kind={msg.provenance.kind} from={msg.provenance.sender_handle}"
-                f"({msg.provenance.sender_account_id}){origin}]"
+                f"({msg.provenance.sender_account_id}){device_tag}{origin}]"
             )
             source = self.build_source(
                 chat_id=str(msg.provenance.party_id),
@@ -777,6 +808,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     "party_id": msg.provenance.party_id,
                     "event_seq": msg.provenance.event_seq,
                     "kind": msg.provenance.kind,
+                    "sender_device_id": msg.provenance.sender_device_id,
                     "is_browser": msg.provenance.is_browser,
                 },
                 message_id=f"mp-{msg.provenance.party_id}-{msg.provenance.event_seq}",
@@ -786,13 +818,16 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
     async def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                messages, _resp = await self.wait_once()
+                messages, resp = await self.wait_once()
                 self.consecutive_errors = 0
                 self.last_error = None
                 for msg in messages:
                     if self._stop_event.is_set():
                         break
                     await self._dispatch_message(msg)
+                # Prevent tight fork-spin when no party is active or wait_timeout_ms == 0.
+                if resp.get("no_active_party") or (self.wait_timeout_ms == 0 and not messages):
+                    await self._sleep_cancelable(self.idle_poll_s)
             except asyncio.CancelledError:
                 break
             except OutpostEofError as exc:
@@ -804,6 +839,16 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     break
                 await self._sleep_cancelable(self.backoff_s)
             except OutpostError as exc:
+                err_lower = str(exc).lower()
+                if "is not active" in err_lower or "code=4040" in err_lower:
+                    LOGGER.info("Active party changed or left; resetting cursor for re-discovery.")
+                    self.cursor = None
+                    if not self._pinned_party_id:
+                        self.party_id = None
+                    self.consecutive_errors = 0
+                    self.last_error = str(exc)
+                    await self._sleep_cancelable(self.idle_poll_s)
+                    continue
                 self.last_error = str(exc)
                 self.consecutive_errors += 1
                 LOGGER.warning("mp-outpost error during party_wait: %s", exc)
@@ -826,6 +871,22 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
             dev_id = st.get("device_id")
             if isinstance(dev_id, int) and dev_id > 0:
                 self._own_device_id = dev_id
+        # Seed cursor at party head on connect so historical messages are not replayed as live events.
+        if self.cursor is None:
+            with contextlib.suppress(Exception):
+                listed = await self.list_parties()
+                parties = listed.get("parties") or []
+                chosen = None
+                if self.party_id is not None:
+                    chosen = next((p for p in parties if isinstance(p, dict) and p.get("party_id") == self.party_id), None)
+                elif parties and isinstance(parties[0], dict):
+                    chosen = parties[0]
+                    self.party_id = int(chosen["party_id"])
+                if chosen is not None:
+                    pid = int(chosen["party_id"])
+                    head_seq = int(chosen.get("next_seq", 0) or 0)
+                    epoch = int(listed.get("daemon_epoch", 0) or 0)
+                    self.cursor = PartyCursor(party_id=pid, after_seq=head_seq, daemon_epoch=epoch)
         await self.start()
         if hasattr(self, "_mark_connected"):
             self._mark_connected()

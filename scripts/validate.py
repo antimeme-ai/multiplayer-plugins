@@ -72,6 +72,7 @@ ALL_MCP_TOOLS = (
     "inbox_send",
     "inbox_read",
     "inbox_ack",
+    "party_listen",
 )
 
 PERSONAL_PATH_RE = re.compile(r"(?:/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+|C:\\\\Users\\\\[A-Za-z0-9._-]+)")

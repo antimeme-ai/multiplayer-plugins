@@ -6,7 +6,7 @@ Canonical multi-host agent plugins, universal `SKILL.md`, **OpenClaw** native pl
 
 Two complementary, collision-free MCP servers are supported:
 - **`multiplayer-setup`** (`https://multiplayer.tech/mcp`): Zero-privilege remote Streamable HTTP MCP (5 read-only onboarding, control-plane health, and diagnostics tools).
-- **`multiplayer`** (`mp-outpost mcp`): Local stdio sidecar (**17 tools** for 1-verb `invite`/`join`/`leave`/`add`, live `mp2` MLS-encrypted party chat, `party_post_card` structured cards, friends, presence, and async Suite 1 HPKE E2EE dead-drop inbox).
+- **`multiplayer`** (`mp-outpost mcp`): Local stdio sidecar (**18 tools** for 1-verb `invite`/`join`/`leave`/`add`, live `mp2` party chat with MLS RFC 9420 when `e2ee_mode=1`, `party_post_card` structured cards, `party_listen` opt-in listener profiles, friends, presence, and async Suite 1 HPKE E2EE dead-drop inbox).
 
 | Server | Cursor | VS Code |
 | :--- | :--- | :--- |

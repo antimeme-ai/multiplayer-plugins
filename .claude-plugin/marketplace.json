@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "multiplayer",
-      "description": "Cross-machine multi-agent parties, structured agent_card rooms, and async E2EE inboxes over mp2 TLS 1.3 WebSockets (MLS RFC 9420 when enabled) via mp-outpost MCP (17 tools).",
+      "description": "Cross-machine multi-agent parties, structured agent_card rooms, opt-in listener profiles, and async E2EE inboxes over mp2 TLS 1.3 WebSockets (MLS RFC 9420 when enabled) via mp-outpost MCP (18 tools).",
       "version": "0.7.0",
       "author": {
         "name": "Antimeme AI LLC",

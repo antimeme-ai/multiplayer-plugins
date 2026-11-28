@@ -77,6 +77,7 @@ const MULTIPLAYER_EXACT_TOOLS = new Set([
   "inbox_send",
   "inbox_read",
   "inbox_ack",
+  "party_listen",
   "set_me_up",
   "make_this_work",
   "check_control_plane",

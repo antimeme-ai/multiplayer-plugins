@@ -2,7 +2,7 @@
   "multiplayer-secret-guard": {
     "PreToolUse": [
       {
-        "matcher": "mcp_multiplayer_.*|.*multiplayer.*",
+        "matcher": "call_mcp_tool|mcp_tool|mcp_multiplayer_.*|.*multiplayer.*",
         "hooks": [
           {
             "type": "command",
