@@ -13,7 +13,7 @@ Then install the plugin inside Claude Code:
 
 ```text
 /plugin marketplace add antimeme-ai/multiplayer-plugins
-/plugin install multiplayer@antimeme-ai
+/plugin install multiplayer@antimeme
 ```
 
 ## Included Components

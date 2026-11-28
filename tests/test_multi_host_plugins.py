@@ -369,7 +369,7 @@ class TestMultiHostPlugins(unittest.TestCase):
             import {{ MULTIPLAYER_MCP_CONFIG, isMultiplayerToolName }} from "./adapters/opencode/src/security.ts";
 
             // OpenCode v2 contract: default export is {{ id: string, setup(ctx) }}
-            assert.equal(serverPlugin.id, "antimeme-ai.multiplayer");
+            assert.equal(serverPlugin.id, "antimeme.multiplayer");
             assert.equal(typeof serverPlugin.setup, "function");
             assert.equal(isMultiplayerToolName("party_listen"), true);
 
@@ -1292,6 +1292,359 @@ class TestMultiHostPlugins(unittest.TestCase):
             self.assertIn("OPENCODE_TUI_DIALOGS_OK", proc.stdout)
             posted = json.loads(say_log.read_text(encoding="utf-8"))
             self.assertIn("hello from opencode dialog", posted)
+
+    def test_opencode_tui_live_party_panel_and_feed_store(self) -> None:
+        """Verify OpenCode v2 /party-panel, PartyFeedStore live streaming, echo filter, 4040 recovery, and SIGTERM stop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_file = tmp_path / "state.json"
+            term_marker = tmp_path / "sigterm_hit.txt"
+            state_file.write_text(json.dumps({"party_id": 777, "wait_calls": 0}), encoding="utf-8")
+            fake_outpost = tmp_path / "fake-mp-outpost"
+            fake_outpost.write_text(
+                f"#!{sys.executable}\n"
+                + textwrap.dedent(
+                    f"""
+                    import json, signal, sys, time
+                    from pathlib import Path
+                    state_path = Path({str(state_file)!r})
+                    term_path = Path({str(term_marker)!r})
+                    def _on_term(_sig, _frame):
+                        term_path.write_text("SIGTERM", encoding="utf-8")
+                        sys.exit(0)
+                    signal.signal(signal.SIGTERM, _on_term)
+                    args = sys.argv[1:]
+                    if args[:1] == ["--json"]:
+                        args = args[1:]
+                    st = json.loads(state_path.read_text(encoding="utf-8"))
+                    if args == ["party", "status"]:
+                        print(json.dumps({{"handle": "antimeme", "device_id": 500, "control_ws_connected": True}}))
+                    elif args == ["party", "list"]:
+                        pid = st["party_id"]
+                        print(json.dumps({{"daemon_epoch": 11, "parties": [{{"party_id": pid, "member_count": 3, "next_seq": 20, "relay_policy": "allow_relays"}}]}}))
+                    elif args[:2] == ["party", "read"]:
+                        pid = int(args[2])
+                        if pid == 777:
+                            print(json.dumps({{"daemon_epoch": 11, "next_seq": 20, "events": [
+                                {{"event_seq": 18, "kind": "chat", "sender_handle": "antimeme", "sender_device_id": 500, "text": "own non-browser echo"}},
+                                {{"event_seq": 19, "kind": "chat", "sender_handle": "phall", "sender_device_id": 901, "text": "\\x1b[31mhi\\x1b[0m \\u202ebidi\\u202c https://clank.party/i/abc#SECRET1234"}},
+                                {{"event_seq": 20, "kind": "chat", "sender_handle": "antimeme", "sender_device_id": 500, "is_browser": True, "text": "web tab msg"}}
+                            ]}}))
+                        else:
+                            print(json.dumps({{"daemon_epoch": 12, "next_seq": 2, "events": [
+                                {{"event_seq": 2, "kind": "chat", "sender_handle": "spongebob", "sender_device_id": 777, "text": "new room hello"}}
+                            ]}}))
+                    elif args[:2] == ["party", "wait"]:
+                        st["wait_calls"] += 1
+                        if st["wait_calls"] == 1:
+                            st["party_id"] = 888
+                            state_path.write_text(json.dumps(st), encoding="utf-8")
+                            sys.stderr.write("code=4040 party is not active\\n")
+                            sys.exit(1)
+                        state_path.write_text(json.dumps(st), encoding="utf-8")
+                        time.sleep(20)
+                        print(json.dumps({{"daemon_epoch": 12, "next_seq": 2, "events": []}}))
+                    else:
+                        sys.stderr.write(f"unexpected args: {{args!r}}\\n")
+                        sys.exit(2)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_outpost.chmod(fake_outpost.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+            node_script = textwrap.dedent(
+                f"""
+                import assert from "node:assert/strict";
+                import opencodeTui, {{ PartyFeedStore, PARTY_PANEL_NAME }} from "./adapters/opencode/src/tui.ts";
+
+                process.env.MP_OUTPOST_BIN = {str(fake_outpost)!r};
+
+                // 1. PartyFeedStore lifecycle: idle before start, seed+filter+sanitize, 4040 switch, immediate SIGTERM stop
+                const store = new PartyFeedStore({{ idleBackoffMs: 50 }});
+                assert.equal(store.isRunning(), false);
+                store.start();
+                assert.equal(store.isRunning(), true);
+
+                let sawFirstRoom = false;
+                let sawSwitchedRoom = false;
+                const deadline = Date.now() + 8000;
+                while (Date.now() < deadline && !sawSwitchedRoom) {{
+                  const snap = store.getSnapshot();
+                  if (snap.partyId === 777 && snap.messages.length >= 2) {{
+                    sawFirstRoom = true;
+                    assert.ok(!snap.messages.some((m) => m.body.includes("own non-browser echo")), "must filter own non-browser echo");
+                    const remote = snap.messages.find((m) => m.handle === "@phall");
+                    assert.ok(remote, "must keep remote peer message");
+                    assert.ok(!remote.body.includes("\\x1b") && !remote.body.includes("[31m") && !remote.body.includes("\\u202e"));
+                    assert.ok(!remote.body.includes("SECRET1234") && remote.body.includes("#[REDACTED]"));
+                    const web = snap.messages.find((m) => m.isBrowser);
+                    assert.ok(web && web.handle === "@antimeme" && web.body.includes("web tab msg"));
+                  }}
+                  if (snap.partyId === 888 && snap.messages.some((m) => m.body.includes("new room hello"))) {{
+                    sawSwitchedRoom = true;
+                  }}
+                  if (!sawSwitchedRoom) await new Promise((r) => setTimeout(r, 40));
+                }}
+                assert.ok(sawSwitchedRoom, "PartyFeedStore must recover from code=4040 and switch to #888");
+                // Give second wait child a moment to spawn before stopping
+                await new Promise((r) => setTimeout(r, 120));
+                const t0 = Date.now();
+                store.stop();
+                assert.equal(store.isRunning(), false);
+                assert.ok(Date.now() - t0 < 500, "stop() must return immediately");
+                await new Promise((r) => setTimeout(r, 150));
+
+                // 2. /party-panel command with mocked ui.panel & cleanup
+                let openPanel = undefined;
+                const panelCalls = [];
+                const toasts = [];
+                const alerts = [];
+                const layers = [];
+                const cleanup = opencodeTui.setup({{
+                  keymap: {{ layer(factory) {{ layers.push(factory()); }} }},
+                  ui: {{
+                    toast: {{ show(t) {{ toasts.push(t); }} }},
+                    dialog: {{ async alert(a) {{ alerts.push(a); }} }},
+                    panel: {{
+                      open(name, opts) {{ openPanel = {{ name, presentation: opts?.presentation ?? "panel" }}; panelCalls.push(["open", name, opts]); return true; }},
+                      close() {{ openPanel = undefined; panelCalls.push(["close"]); }},
+                      current() {{ return openPanel; }},
+                    }},
+                    slot(spec) {{ spec.render(); }},
+                  }},
+                }});
+
+                assert.equal(opencodeTui.id, "antimeme.multiplayer");
+                const panelCmd = layers[0].commands.find((c) => c.id === "multiplayer.panel");
+                assert.ok(panelCmd && panelCmd.slash.name === "party-panel" && panelCmd.slash.aliases.includes("mp-panel") && panelCmd.palette === true);
+
+                await panelCmd.run("on");
+                assert.equal(openPanel?.name, PARTY_PANEL_NAME);
+                assert.equal(openPanel?.presentation, "panel");
+
+                await panelCmd.run("status");
+                assert.ok(alerts.some((a) => a.message.includes("Panel: OPEN")));
+
+                await panelCmd.run("full");
+                assert.equal(openPanel?.presentation, "fullscreen");
+
+                await panelCmd.run("sidebar");
+                assert.ok(toasts.some((t) => t.message.toLowerCase().includes("sidebar")));
+
+                await panelCmd.run("off");
+                assert.equal(openPanel, undefined);
+
+                if (typeof cleanup === "function") cleanup();
+
+                // 3. Minimal context without ui.panel/ui.router falls back cleanly to dialog.alert
+                const minAlerts = [];
+                const minLayers = [];
+                const minCleanup = opencodeTui.setup({{
+                  keymap: {{ layer(factory) {{ minLayers.push(factory()); }} }},
+                  ui: {{
+                    toast: {{ show() {{}} }},
+                    dialog: {{ async alert(a) {{ minAlerts.push(a); }} }},
+                    slot(spec) {{ spec.render(); }},
+                  }},
+                }});
+                const minPanelCmd = minLayers[0].commands.find((c) => c.id === "multiplayer.panel");
+                await minPanelCmd.run("on");
+                assert.ok(minAlerts.some((a) => a.message.includes("UNTRUSTED EXTERNAL DATA")));
+                if (typeof minCleanup === "function") minCleanup();
+
+                console.log("OPENCODE_LIVE_PANEL_OK");
+                """
+            )
+            proc = subprocess.run(
+                ["node", "--input-type=module", "-e", node_script],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}")
+            self.assertIn("OPENCODE_LIVE_PANEL_OK", proc.stdout)
+            self.assertTrue(term_marker.is_file(), "expected SIGTERM marker on blocked party wait child")
+
+    def test_pi_native_party_panels_and_live_watcher(self) -> None:
+        """Verify Pi docked widget (/party-panel), interactive overlay (/party-overlay, ctrl+shift+m, /party-chat --inline), and live PartyFeedWatcher."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_file = tmp_path / "state.json"
+            say_log = tmp_path / "say_log.json"
+            state_file.write_text(json.dumps({"party_id": 777, "wait_calls": 0}), encoding="utf-8")
+            fake_outpost = tmp_path / "fake-mp-outpost"
+            fake_outpost.write_text(
+                f"#!{sys.executable}\n"
+                + textwrap.dedent(
+                    f"""
+                    import json, sys, time
+                    from pathlib import Path
+                    state_path = Path({str(state_file)!r})
+                    say_path = Path({str(say_log)!r})
+                    args = sys.argv[1:]
+                    if args[:1] == ["--json"]:
+                        args = args[1:]
+                    st = json.loads(state_path.read_text(encoding="utf-8"))
+                    if args == ["party", "status"]:
+                        print(json.dumps({{"handle": "antimeme", "device_id": 500, "control_ws_connected": True}}))
+                    elif args == ["party", "list"]:
+                        pid = st["party_id"]
+                        print(json.dumps({{"daemon_epoch": 11, "parties": [{{"party_id": pid, "member_count": 3, "next_seq": 20, "relay_policy": "allow_relays"}}]}}))
+                    elif args[:2] == ["party", "read"]:
+                        pid = int(args[2])
+                        if pid == 777:
+                            print(json.dumps({{"daemon_epoch": 11, "next_seq": 20, "events": [
+                                {{"event_seq": 18, "kind": "chat", "sender_handle": "antimeme", "sender_device_id": 500, "body": "own echo"}},
+                                {{"event_seq": 19, "kind": "chat", "sender_handle": "phall", "sender_device_id": 901, "body": "\\x1b[31mhi\\x1b[0m https://clank.party/i/abc#SECRET1234"}},
+                                {{"event_seq": 20, "kind": "chat", "sender_handle": "antimeme", "sender_device_id": 500, "is_browser": True, "body": "web tab msg"}}
+                            ]}}))
+                        else:
+                            print(json.dumps({{"daemon_epoch": 12, "next_seq": 2, "events": [
+                                {{"event_seq": 2, "kind": "agent_card", "sender_handle": "spongebob", "sender_device_id": 777, "card": {{"title": "Build", "status": "done", "summary": "all green"}}}}
+                            ]}}))
+                    elif args[:2] == ["party", "wait"]:
+                        st["wait_calls"] += 1
+                        if st["wait_calls"] == 1:
+                            st["party_id"] = 888
+                            state_path.write_text(json.dumps(st), encoding="utf-8")
+                            sys.stderr.write("code=4040 party is not active\\n")
+                            sys.exit(1)
+                        state_path.write_text(json.dumps(st), encoding="utf-8")
+                        time.sleep(20)
+                        print(json.dumps({{"daemon_epoch": 12, "next_seq": 2, "events": []}}))
+                    elif args[:2] == ["party", "say"]:
+                        existing = json.loads(say_path.read_text(encoding="utf-8")) if say_path.is_file() else []
+                        existing.append(args)
+                        say_path.write_text(json.dumps(existing), encoding="utf-8")
+                        print(json.dumps({{"ok": True}}))
+                    else:
+                        sys.stderr.write(f"unexpected args: {{args!r}}\\n")
+                        sys.exit(2)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_outpost.chmod(fake_outpost.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+            node_script = textwrap.dedent(
+                f"""
+                import assert from "node:assert/strict";
+                import piExt, {{ PartyFeedWatcher, visibleWidth }} from "./adapters/pi/index.ts";
+
+                process.env.MP_OUTPOST_BIN = {str(fake_outpost)!r};
+
+                const cmds = new Map();
+                const shortcuts = new Map();
+                const events = new Map();
+                piExt({{
+                  registerCommand(n, s) {{ cmds.set(n, s); }},
+                  registerShortcut(k, s) {{ shortcuts.set(k, s); }},
+                  registerTool() {{}},
+                  on(ev, h) {{ events.set(ev, h); }},
+                }});
+
+                assert.ok(cmds.has("party-panel"), "Pi must register /party-panel");
+                assert.ok(cmds.has("party-overlay"), "Pi must register /party-overlay");
+                assert.ok(shortcuts.has("ctrl+shift+m"), "Pi must register ctrl+shift+m");
+                assert.ok(events.has("session_shutdown"), "Pi must register session_shutdown");
+
+                const widgets = new Map();
+                const statuses = new Map();
+                const notes = [];
+                let renderCount = 0;
+                const fakeTui = {{ requestRender() {{ renderCount += 1; }}, terminal: {{ rows: 30 }} }};
+                const fakeTheme = {{ fg: (_c, t) => `\\x1b[36m${{t}}\\x1b[0m`, bold: (t) => `\\x1b[1m${{t}}\\x1b[0m` }};
+
+                const ctx = {{
+                  ui: {{
+                    notify(m, lvl) {{ notes.push([lvl, m]); }},
+                    setStatus(k, v) {{ statuses.set(k, v); }},
+                    setWidget(k, content, opts) {{ widgets.set(k, {{ content, opts }}); }},
+                    async custom(factory, opts) {{
+                      assert.equal(opts?.overlay, true);
+                      let closed = false;
+                      const comp = await factory(fakeTui, fakeTheme, {{}}, () => {{ closed = true; }});
+                      for (const w of [24, 50, 80, 120]) {{
+                        const lines = comp.render(w);
+                        assert.ok(lines.length > 0);
+                        for (const line of lines) {{
+                          assert.ok(visibleWidth(line) <= w, `overlay line width ${{visibleWidth(line)}} > ${{w}}`);
+                        }}
+                      }}
+                      const joined = comp.render(80).join("\\n");
+                      assert.ok(joined.includes("UNTRUSTED EXTERNAL DATA"));
+
+                      // Pre-exec secret refusal inside overlay composer (must NOT close or call party say)
+                      comp.handleInput("mpinv1_" + "A".repeat(44));
+                      comp.handleInput("\\r");
+                      assert.equal(closed, false);
+                      assert.ok(comp.render(80).join("\\n").toLowerCase().includes("secret"));
+
+                      // Clear with Ctrl+U, type valid message, Enter to send
+                      comp.handleInput("\\x15");
+                      comp.handleInput("hello from pi overlay");
+                      comp.handleInput("\\r");
+                      await new Promise((r) => setTimeout(r, 250));
+                      assert.equal(closed, false);
+
+                      // Scroll with Up / Down / mouse wheel and close with Esc
+                      comp.handleInput("\\x1b[A");
+                      comp.handleInput("\\x1b[<64;10;10M");
+                      comp.handleInput("\\x1b");
+                      assert.equal(closed, true);
+                      comp.dispose?.();
+                    }},
+                  }},
+                }};
+
+                // 1. Docked panel /party-panel below -> renders strictly within width & recovers 4040 -> #888
+                await cmds.get("party-panel").handler("below", ctx);
+                const wEntry = widgets.get("multiplayer-chat");
+                assert.equal(wEntry?.opts?.placement, "belowEditor");
+                const widgetComp = typeof wEntry.content === "function" ? wEntry.content(fakeTui, fakeTheme) : null;
+                assert.ok(widgetComp, "expected widget component factory");
+
+                const deadline = Date.now() + 8000;
+                let sawCard = false;
+                while (Date.now() < deadline && !sawCard) {{
+                  const text = widgetComp.render(80).join("\\n");
+                  if (text.includes("#888") && text.includes("Build")) sawCard = true;
+                  else await new Promise((r) => setTimeout(r, 50));
+                }}
+                assert.ok(sawCard, "docked widget must recover from 4040 and render new room #888 agent_card");
+                assert.ok(renderCount > 0, "expected tui.requestRender() calls");
+                for (const w of [12, 40, 80, 120]) {{
+                  for (const line of widgetComp.render(w)) {{
+                    assert.ok(visibleWidth(line) <= w, `widget line width ${{visibleWidth(line)}} > ${{w}}`);
+                  }}
+                }}
+
+                // 2. Interactive overlay via /party-overlay
+                await cmds.get("party-overlay").handler("", ctx);
+
+                // 3. Clean unmount on session_shutdown
+                await events.get("session_shutdown")({{}}, ctx);
+                assert.equal(widgets.get("multiplayer-chat")?.content, undefined);
+
+                console.log("PI_NATIVE_PANELS_OK");
+                """
+            )
+            proc = subprocess.run(
+                ["node", "--input-type=module", "-e", node_script],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}")
+            self.assertIn("PI_NATIVE_PANELS_OK", proc.stdout)
+            posted = json.loads(say_log.read_text(encoding="utf-8"))
+            self.assertEqual(len(posted), 1, f"secret must be refused; only 1 valid say expected, got {posted!r}")
+            self.assertIn("hello from pi overlay", posted[0])
 
 
 if __name__ == "__main__":

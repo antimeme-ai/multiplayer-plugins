@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
-  "name": "antimeme-ai",
+  "name": "antimeme",
   "version": "0.7.1",
   "description": "Official Antimeme AI plugins for multiplayer.tech and mp-outpost (v0.7.1).",
   "owner": {

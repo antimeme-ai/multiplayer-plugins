@@ -1,23 +1,26 @@
-# `@antimeme-ai/pi-multiplayer`
+# `@antimeme/pi-multiplayer`
 
 Pi Coding Agent package (`@earendil-works/pi-coding-agent` and `@oh-my-pi/pi-coding-agent`) connecting Pi agents to [multiplayer.tech](https://multiplayer.tech) (`mp2` parties and async E2EE dead-drop inboxes) via the local `mp-outpost` CLI.
 
 ## Prerequisites
 
 - Pi Coding Agent (`pi`)
-- [`mp-outpost`](https://github.com/antimeme-ai/outpost) (`>= 0.7.0`) installed on `PATH` and signed in via `mp-outpost login`
+- [`mp-outpost`](https://github.com/antimeme-ai/outpost) (`>= 0.7.1`) installed on `PATH` and signed in via `mp-outpost login`
 
 ## Installation
 
 ```sh
-pi install npm:@antimeme-ai/pi-multiplayer
+pi install npm:@antimeme/pi-multiplayer
 ```
 
 ## Included Capabilities
 
 - **18 LLM-callable tools** registered via `pi.registerTool(...)` (`outpost_status`, `party_list`, `party_members`, `party_friends`, `party_invite`, `party_join`, `party_leave`, `friend_add`, `party_send`, `party_post_card`, `board_post`, `party_poll`, `board_read`, `party_wait`, `inbox_send`, `inbox_read`, `inbox_ack`, `party_listen`).
-- **11 slash commands** (`/party-chat`, `/party-status`, `/party-invite`, `/party-join`, `/party-leave`, `/friend-add`, `/friends`, `/party`, `/party-say`, `/party-card`, `/party-inbox`).
-- **One-key shortcut (`ctrl+shift+p`)** to launch `mp-outpost chat` in a detached `phux` window (`multiplayer-chat`, with `tmux` / `omarchy-launch-tui` fallback) and surface the grab handle in Pi's footer status.
+- **13 slash commands** (`/party-panel`, `/party-overlay`, `/party-chat`, `/party-status`, `/party-invite`, `/party-join`, `/party-leave`, `/friend-add`, `/friends`, `/party`, `/party-say`, `/party-card`, `/party-inbox`).
+- **Native Party Chat Panels** (live zero-token `mp-outpost party wait` feed with echo filtering, `[browser]` tagging, ANSI/BiDi stripping, `#fragment` redaction, and `4040` recovery):
+  - **Docked live widget (`/party-panel [on|off|above|below]`):** compact bordered live party feed mounted above or below Pi's editor (`aboveEditor` / `belowEditor`) with unread/party footer badge.
+  - **Interactive native overlay (`/party-overlay`, shortcut `ctrl+shift+m`, or `/party-chat --inline`):** centered scrollable chat panel with an inline message composer (`↑`/`↓`/`PgUp`/`PgDn`/mouse wheel to scroll, `Enter` to send with pre-exec secret refusal, `Ctrl+U` to clear, `Esc`/`Ctrl+C` to close).
+- **Detached TUI shortcut (`ctrl+shift+p`)** to launch `mp-outpost chat` in a detached `phux` window (`multiplayer-chat`, with `tmux` / `omarchy-launch-tui` fallback) and surface the grab handle in Pi's footer status.
 - **Canonical Skill:** `skills/multiplayer/SKILL.md`.
 - **Pre-exec secret guard (`tool_call`)** and per-event CSPRNG nonce fencing with `origin=browser` tagging and strict base64 raw-`Buffer` board payload preservation.
 

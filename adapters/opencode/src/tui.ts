@@ -4,6 +4,10 @@
  * Adds:
  * - `/party` (alias `/mp`, global shortcut `ctrl+alt+m`, Command Palette) opening a
  *   native `context.ui.dialog.select` Multiplayer quick menu.
+ * - `/party-panel [on|off|full|sidebar|status]` (alias `/mp-panel`) opening a live
+ *   native OpenCode v2.3.2 Party Chat display panel (`session.panel` + `ui.router`
+ *   fallback on home screen, collapsible `sidebar.content` live feed, and a compact
+ *   `prompt.footer.status` indicator while active).
  * - `/party-chat [target]` (alias `/mp-chat`) launching or reusing `mp-outpost chat`
  *   in a detached `phux` window (`tmux` / `omarchy-launch-tui` fallback).
  * - `/party-say [message]` (alias `/mp-say`) sending a secret-checked message inline
@@ -17,16 +21,27 @@
  */
 
 import { spawn } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { detectForbiddenSecret } from "./security.ts";
+import {
+  PartyFeedStore,
+  execCapture,
+  parsePartyEvent,
+  redactUrlFragments,
+  resolveBinaryPath,
+  runOutpostJson,
+  sanitizeSingleLine,
+  type PartyChatMessage,
+  type PartyFeedSnapshot,
+} from "./party-feed.ts";
+
+export { PartyFeedStore } from "./party-feed.ts";
+export type { PartyChatMessage, PartyFeedSnapshot, PartyFeedStatus } from "./party-feed.ts";
+
+export const PARTY_PANEL_NAME = "multiplayer.party";
 
 const DEFAULT_SESSION = "multiplayer-chat";
 const SAFE_SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SAFE_TARGET_RE = /^@?[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const URL_FRAGMENT_RE =
-  /((?:https?:\/\/)?(?:(?:www\.)?(?:clank\.party|multiplayer\.tech|mp\.gg)\/[^\s#"']+?|[^\s#"']+?\/(?:p\/)?i\/[A-Za-z0-9_-]+))#[A-Za-z0-9_-]+/gi;
 const AMBIGUOUS_SAY_FLAGS = new Set([
   "--scope",
   "--to-device",
@@ -71,6 +86,62 @@ export interface OpenCodeTuiDialog {
   set?(options: { size?: "small" | "medium" | "large"; centered?: boolean }): void;
 }
 
+export interface OpenCodeTuiPanelInput {
+  readonly name: string;
+  readonly sessionID?: string;
+  readonly width?: number;
+  readonly presentation?: "panel" | "fullscreen";
+  readonly focused?: boolean;
+  readonly focus?: () => void;
+  readonly close?: () => void;
+  readonly toggleFullscreen?: () => void;
+}
+
+export interface OpenCodeTuiPanelApi {
+  open(name: string, options?: { presentation?: "panel" | "fullscreen" }): boolean;
+  close(): void;
+  current(): { readonly name: string; readonly sessionID: string } | undefined;
+}
+
+export interface OpenCodeTuiRoute {
+  readonly type: "home" | "session" | "plugin";
+  readonly sessionID?: string;
+  readonly id?: string;
+  readonly name?: string;
+  readonly data?: Record<string, unknown>;
+}
+
+export interface OpenCodeTuiRouterApi {
+  register(spec: { readonly name: string; readonly render: (args: { data?: Record<string, unknown> }) => unknown }): () => void;
+  navigate(route: OpenCodeTuiRoute): void;
+  current(): OpenCodeTuiRoute;
+}
+
+export interface OpenCodeTuiTheme {
+  readonly text?: {
+    readonly base?: string;
+    readonly muted?: string;
+    readonly feedback?: {
+      readonly success?: { readonly base?: string };
+      readonly warning?: { readonly base?: string };
+      readonly error?: { readonly base?: string };
+      readonly info?: { readonly base?: string };
+    };
+  };
+  readonly background?: {
+    readonly base?: string;
+    readonly raised?: {
+      readonly base?: string;
+      readonly high?: string;
+    };
+  };
+  readonly border?: { readonly base?: string };
+  readonly hue?: {
+    readonly accent?: Record<number, string>;
+    readonly interactive?: Record<number, string>;
+  };
+}
+
 export interface OpenCodeTuiKeymapCommand {
   readonly id?: string;
   readonly title?: string;
@@ -80,17 +151,25 @@ export interface OpenCodeTuiKeymapCommand {
   readonly palette?: true;
   readonly slash?: { readonly name: string; readonly aliases?: string[]; readonly arguments?: true };
   readonly suggested?: boolean | (() => boolean);
+  readonly enabled?: () => boolean;
   readonly run: (input?: string) => void | false | Promise<void>;
 }
 
 export interface OpenCodeTuiContext {
+  readonly theme?: OpenCodeTuiTheme;
   readonly keymap: {
     layer(factory: () => { readonly mode?: string; readonly commands?: readonly OpenCodeTuiKeymapCommand[] }): void;
   };
   readonly ui: {
     readonly toast: OpenCodeTuiToast;
     readonly dialog?: OpenCodeTuiDialog;
-    readonly slot?: (spec: { readonly append?: string; readonly prepend?: string; readonly render: () => unknown }) => void;
+    readonly panel?: OpenCodeTuiPanelApi;
+    readonly router?: OpenCodeTuiRouterApi;
+    readonly slot?: (spec: {
+      readonly append?: string;
+      readonly prepend?: string;
+      readonly render: (input?: Record<string, unknown>) => unknown;
+    }) => void | (() => void);
   };
 }
 
@@ -105,105 +184,99 @@ export interface DetachedChatLaunchResult {
   message: string;
 }
 
-function redactUrlFragments(text: string): string {
-  return text.replace(URL_FRAGMENT_RE, "$1#[REDACTED]");
+interface SolidRuntime {
+  createSignal<T>(value: T): [() => T, (next: T | ((prev: T) => T)) => T];
+  createEffect(fn: () => void): void;
+  onCleanup(fn: () => void): void;
+  Show: unknown;
+  For: unknown;
 }
 
-function sanitizePeerText(raw: string): string {
-  let out = "";
-  for (const ch of raw) {
-    if (ch === "\n" || ch === "\t") {
-      out += ch;
-      continue;
-    }
-    const cp = ch.codePointAt(0) ?? 0;
-    if (
-      cp <= 0x1f ||
-      cp === 0x7f ||
-      (cp >= 0x80 && cp <= 0x9f) ||
-      cp === 0x2028 ||
-      cp === 0x2029 ||
-      cp === 0x061c ||
-      cp === 0x200e ||
-      cp === 0x200f ||
-      cp === 0xfeff ||
-      (cp >= 0x202a && cp <= 0x202e) ||
-      (cp >= 0x2066 && cp <= 0x2069) ||
-      (cp >= 0x200b && cp <= 0x200d) ||
-      (cp >= 0xe0000 && cp <= 0xe007f)
-    ) {
-      continue;
-    }
-    out += ch;
-  }
-  return out;
+interface OpenTuiRuntime {
+  createElement(tag: string): Record<string, unknown>;
+  createTextNode(value: string): unknown;
+  createComponent(comp: unknown, props: Record<string, unknown>): unknown;
+  insert(parent: unknown, accessor: unknown, marker?: unknown): void;
+  insertNode(parent: unknown, node: unknown, anchor?: unknown): void;
+  setProp(node: unknown, key: string, value: unknown, prev?: unknown): unknown;
+  effect(fn: (prev?: unknown) => unknown, init?: unknown): void;
+  use?(fn: (el: unknown, accessor: () => unknown) => void, el: unknown, accessor?: () => unknown): void;
 }
 
-function sanitizeSingleLine(raw: string): string {
-  return sanitizePeerText(raw).replace(/[\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+interface LoadedOpenTuiRuntime {
+  solid: SolidRuntime;
+  opentui: OpenTuiRuntime;
 }
 
-async function execCapture(
-  binary: string,
-  args: string[],
-  timeoutMs = 10_000,
-): Promise<{ code: number; stdout: string; stderr: string; notFound?: boolean }> {
-  return await new Promise((resolve) => {
-    let settled = false;
-    const child = spawn(binary, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
-    const outChunks: Buffer[] = [];
-    const errChunks: Buffer[] = [];
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      resolve({ code: 124, stdout: "", stderr: "timed out" });
-    }, timeoutMs);
-    child.stdout.on("data", (c: Buffer) => outChunks.push(c));
-    child.stderr.on("data", (c: Buffer) => errChunks.push(c));
-    child.on("error", (err: NodeJS.ErrnoException) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ code: err.code === "ENOENT" ? 127 : 1, stdout: "", stderr: err.message, notFound: err.code === "ENOENT" });
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({
-        code: code ?? 1,
-        stdout: Buffer.concat(outChunks).toString("utf8").trim(),
-        stderr: Buffer.concat(errChunks).toString("utf8").trim(),
-      });
-    });
-  });
+interface ScrollboxLike {
+  scrollBy?(delta: number): void;
+  scrollTo?(offset: number): void;
+  scrollHeight?: number;
+  viewport?: { height?: number };
 }
 
-function resolveBinaryPath(binary: string): string {
-  if (!binary || binary.includes("/") || binary.includes("\\")) return binary;
-  const searchDirs = [
-    ...(process.env.PATH ? process.env.PATH.split(path.delimiter) : []),
-    path.join(os.homedir(), ".local", "bin"),
-    path.join(os.homedir(), ".cargo", "bin"),
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-  ];
-  for (const dir of searchDirs) {
-    if (!dir) continue;
-    const cand = path.join(dir, binary);
+interface PanelUiState {
+  panelOpen: boolean;
+  sidebarOpen: boolean;
+  sidebarExpanded: boolean;
+  nativeRuntimeLoaded: boolean;
+  returnRoute?: OpenCodeTuiRoute;
+}
+
+let cachedRuntimePromise: Promise<LoadedOpenTuiRuntime | null> | null = null;
+
+/**
+ * Dynamically load OpenCode v2.3.2's bundled SolidJS + OpenTUI runtime modules.
+ *
+ * Inside OpenCode v2.3.2 (Bun + `bun-plugin-opentui-runtime-modules`), literal
+ * `import("solid-js")` and `import("@opentui/solid")` are rewritten to OpenCode's
+ * shared reactive host modules. In plain Node or non-OpenCode Bun test harnesses,
+ * the imports fail cleanly and resolve to `null`.
+ */
+function loadOpenTuiRuntime(): Promise<LoadedOpenTuiRuntime | null> {
+  if (cachedRuntimePromise !== null) return cachedRuntimePromise;
+  cachedRuntimePromise = (async () => {
     try {
-      fs.accessSync(cand, fs.constants.X_OK);
-      if (fs.statSync(cand).isFile()) return cand;
+      // Use literal import() calls so OpenCode's regex rewriter intercepts them.
+      const [solidMod, opentuiMod] = await Promise.all([
+        import("solid-js") as Promise<Record<string, unknown>>,
+        import("@opentui/solid") as Promise<Record<string, unknown>>,
+      ]);
+      if (
+        typeof solidMod?.createSignal !== "function" ||
+        typeof solidMod?.onCleanup !== "function" ||
+        typeof opentuiMod?.createElement !== "function" ||
+        typeof opentuiMod?.insert !== "function" ||
+        typeof opentuiMod?.setProp !== "function"
+      ) {
+        return null;
+      }
+      return {
+        solid: solidMod as unknown as SolidRuntime,
+        opentui: opentuiMod as unknown as OpenTuiRuntime,
+      };
     } catch {
-      // continue
+      return null;
     }
-  }
-  return binary;
+  })();
+  return cachedRuntimePromise;
+}
+
+function themeColors(theme?: OpenCodeTuiTheme) {
+  return {
+    bg: theme?.background?.base ?? "#121212",
+    bgRaised: theme?.background?.raised?.base ?? "#1c1c1c",
+    bgHighlight: theme?.background?.raised?.high ?? "#262626",
+    fg: theme?.text?.base ?? "#e5e5e5",
+    muted: theme?.text?.muted ?? "#8a8a8a",
+    success: theme?.text?.feedback?.success?.base ?? "#4ade80",
+    warning: theme?.text?.feedback?.warning?.base ?? "#facc15",
+    error: theme?.text?.feedback?.error?.base ?? "#f87171",
+    info: theme?.text?.feedback?.info?.base ?? "#60a5fa",
+    accent: theme?.hue?.accent?.[500] ?? theme?.text?.feedback?.info?.base ?? "#60a5fa",
+    interactive: theme?.hue?.interactive?.[200] ?? theme?.text?.feedback?.info?.base ?? "#93c5fd",
+    border: theme?.border?.base ?? "#3f3f46",
+  };
 }
 
 function formatTerminalAddress(val: unknown): string | undefined {
@@ -253,30 +326,6 @@ function extractActiveTerminal(lsData: unknown, session: string): string | undef
   return undefined;
 }
 
-async function runOutpostJson(
-  subArgs: string[],
-  timeoutMs = 8_000,
-): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string }> {
-  const bin = resolveBinaryPath(process.env.MP_OUTPOST_BIN?.trim() || "mp-outpost");
-  const res = await execCapture(bin, ["--json", ...subArgs], timeoutMs);
-  if (res.notFound) {
-    return { ok: false, error: `mp-outpost binary '${bin}' not found on PATH.` };
-  }
-  if (res.code !== 0 || !res.stdout) {
-    const msg = redactUrlFragments(res.stderr || res.stdout || `mp-outpost exited with status ${res.code}`);
-    return { ok: false, error: msg };
-  }
-  try {
-    const parsed = JSON.parse(res.stdout) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return { ok: false, error: "Unexpected JSON response from mp-outpost." };
-    }
-    return { ok: true, data: parsed as Record<string, unknown> };
-  } catch {
-    return { ok: false, error: "Invalid JSON output from mp-outpost." };
-  }
-}
-
 async function showAlertOrToast(
   context: OpenCodeTuiContext,
   title: string,
@@ -288,32 +337,6 @@ async function showAlertOrToast(
     return;
   }
   context.ui.toast.show({ title, message, variant, duration: 7000 });
-}
-
-function extractEventBody(ev: Record<string, unknown>): string {
-  for (const key of ["text", "body", "message"]) {
-    const val = ev[key];
-    if (typeof val === "string" && val.trim()) return val;
-  }
-  const payload = ev.payload;
-  if (typeof payload === "string" && payload.trim()) return payload;
-  if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-    const p = payload as Record<string, unknown>;
-    if (p.type === "agent_card" || "title" in p) {
-      const title = typeof p.title === "string" ? p.title.trim() : "";
-      const summary = typeof p.summary === "string" ? p.summary.trim() : "";
-      const status = typeof p.status === "string" ? p.status.trim() : "";
-      const tag = status ? `[${status}] ` : "";
-      if (title && summary) return `card: ${tag}${title} — ${summary}`;
-      if (title || summary) return `card: ${tag}${title || summary}`;
-    }
-    try {
-      return JSON.stringify(payload);
-    } catch {
-      return "";
-    }
-  }
-  return "";
 }
 
 async function getActiveParty(): Promise<
@@ -593,19 +616,12 @@ async function runPartyRead(context: OpenCodeTuiContext): Promise<void> {
   const events = Array.isArray(res.data.events) ? res.data.events : [];
   const lines: string[] = [];
   for (const raw of events) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-    const ev = raw as Record<string, unknown>;
-    const kind = String(ev.kind ?? "unknown");
-    if (kind === "membership_changed" || kind === "system") continue;
-    const body = redactUrlFragments(sanitizePeerText(extractEventBody(ev))).trim();
-    if (!body) continue;
-    const handle = sanitizeSingleLine(String(ev.sender_handle ?? ev.from ?? "peer")) || "peer";
-    const client = sanitizeSingleLine(String(ev.sender_client ?? ev.client ?? "")).toLowerCase();
-    const isBrowser = Boolean(ev.is_browser) || client === "web" || client === "browser";
-    const seq = typeof ev.event_seq === "number" ? ev.event_seq : typeof ev.seq === "number" ? ev.seq : 0;
-    const atHandle = handle.startsWith("@") ? handle : `@${handle}`;
-    const originTag = isBrowser ? " [browser]" : "";
-    lines.push(`#${seq} ${atHandle}${originTag}: ${body}`);
+    const parsed = parsePartyEvent(raw, { filterOwnEcho: false });
+    if (!parsed.message) continue;
+    const m = parsed.message;
+    const originTag = m.isBrowser ? " [browser]" : "";
+    const cardTag = m.isCard ? "card: " : "";
+    lines.push(`#${m.seq} ${m.handle}${originTag}: ${cardTag}${m.body}`);
   }
 
   const message =
@@ -714,16 +730,1024 @@ async function runPartyListenStatus(context: OpenCodeTuiContext): Promise<void> 
   await showAlertOrToast(context, "Multiplayer Listen Profile", lines.join("\n"), "info");
 }
 
-async function runPartyMenu(context: OpenCodeTuiContext): Promise<void> {
+class PartyPanelController {
+  readonly feed: PartyFeedStore;
+  private readonly context: OpenCodeTuiContext;
+  private state: PanelUiState = {
+    panelOpen: false,
+    sidebarOpen: false,
+    sidebarExpanded: true,
+    nativeRuntimeLoaded: false,
+  };
+  private uiListeners = new Set<(state: PanelUiState) => void>();
+
+  constructor(context: OpenCodeTuiContext, feed?: PartyFeedStore) {
+    this.context = context;
+    this.feed = feed ?? new PartyFeedStore();
+  }
+
+  getState(): PanelUiState {
+    return this.state;
+  }
+
+  subscribeUi(listener: (state: PanelUiState) => void): () => void {
+    this.uiListeners.add(listener);
+    return () => {
+      this.uiListeners.delete(listener);
+    };
+  }
+
+  private emitUi(patch: Partial<PanelUiState>): void {
+    this.state = { ...this.state, ...patch };
+    for (const listener of [...this.uiListeners]) {
+      try {
+        listener(this.state);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  markNativeRuntimeLoaded(): void {
+    this.emitUi({ nativeRuntimeLoaded: true });
+  }
+
+  private syncFeedLifecycle(): void {
+    if (this.state.panelOpen || this.state.sidebarOpen) {
+      this.feed.start();
+    } else {
+      this.feed.stop();
+    }
+  }
+
+  isPanelActiveInHost(): boolean {
+    const panelCur = this.context.ui?.panel?.current?.();
+    if (panelCur?.name === PARTY_PANEL_NAME) return true;
+    const routeCur = this.context.ui?.router?.current?.();
+    if (routeCur?.type === "plugin" && routeCur.name === PARTY_PANEL_NAME) return true;
+    return this.state.panelOpen;
+  }
+
+  notifyPanelMounted(focused = true): void {
+    this.emitUi({ panelOpen: true });
+    this.feed.setPanelFocused(focused);
+    this.syncFeedLifecycle();
+  }
+
+  notifyPanelUnmounted(): void {
+    this.feed.setPanelFocused(false);
+    // Only mark closed if host no longer has our panel or plugin route active.
+    const panelCur = this.context.ui?.panel?.current?.();
+    const routeCur = this.context.ui?.router?.current?.();
+    const stillHostOpen =
+      panelCur?.name === PARTY_PANEL_NAME ||
+      (routeCur?.type === "plugin" && routeCur.name === PARTY_PANEL_NAME);
+    if (!stillHostOpen) {
+      this.emitUi({ panelOpen: false });
+      this.syncFeedLifecycle();
+    }
+  }
+
+  async openPanel(presentation: "panel" | "fullscreen" = "panel"): Promise<boolean> {
+    this.context.ui?.dialog?.clear?.();
+    const panelApi = this.context.ui?.panel;
+    const routerApi = this.context.ui?.router;
+
+    if (panelApi && typeof panelApi.open === "function") {
+      const opened = panelApi.open(PARTY_PANEL_NAME, { presentation });
+      if (opened) {
+        this.emitUi({ panelOpen: true });
+        this.feed.setPanelFocused(true);
+        this.syncFeedLifecycle();
+        return true;
+      }
+    }
+
+    if (routerApi && typeof routerApi.navigate === "function") {
+      const cur = typeof routerApi.current === "function" ? routerApi.current() : { type: "home" as const };
+      const returnRoute: OpenCodeTuiRoute =
+        cur.type === "session" && cur.sessionID
+          ? { type: "session", sessionID: cur.sessionID }
+          : cur.type === "plugin" && cur.name && cur.name !== PARTY_PANEL_NAME
+            ? { type: "plugin", id: cur.id, name: cur.name, ...(cur.data ? { data: { ...cur.data } } : {}) }
+            : { type: "home" };
+      this.emitUi({ panelOpen: true, returnRoute });
+      this.feed.setPanelFocused(true);
+      this.syncFeedLifecycle();
+      routerApi.navigate({
+        type: "plugin",
+        name: PARTY_PANEL_NAME,
+        data: { sessionID: cur.type === "session" ? cur.sessionID : undefined, returnRoute },
+      });
+      return true;
+    }
+
+    return false;
+  }
+
+  closePanel(stopSidebar = false): void {
+    const panelApi = this.context.ui?.panel;
+    const routerApi = this.context.ui?.router;
+
+    if (panelApi?.current?.()?.name === PARTY_PANEL_NAME) {
+      panelApi.close();
+    }
+    const curRoute = routerApi?.current?.();
+    if (curRoute?.type === "plugin" && curRoute.name === PARTY_PANEL_NAME) {
+      routerApi?.navigate(this.state.returnRoute ?? { type: "home" });
+    }
+
+    this.feed.setPanelFocused(false);
+    this.emitUi({
+      panelOpen: false,
+      ...(stopSidebar ? { sidebarOpen: false } : {}),
+    });
+    this.syncFeedLifecycle();
+  }
+
+  toggleSidebar(): boolean {
+    const next = !this.state.sidebarOpen;
+    this.emitUi({ sidebarOpen: next, sidebarExpanded: true });
+    this.syncFeedLifecycle();
+    return next;
+  }
+
+  toggleSidebarExpanded(): void {
+    this.emitUi({ sidebarExpanded: !this.state.sidebarExpanded });
+  }
+
+  async handlePanelCommand(rawInput?: string): Promise<void> {
+    const arg = (rawInput ?? "").trim().toLowerCase();
+
+    if (arg === "status") {
+      const snap = this.feed.getSnapshot();
+      const lines = [
+        `Panel: ${this.isPanelActiveInHost() ? "OPEN" : "CLOSED"} · Sidebar feed: ${this.state.sidebarOpen ? "ON" : "OFF"}`,
+        `Feed loop: ${snap.running ? snap.status.toUpperCase() : "IDLE (0 background processes)"}`,
+        snap.partyId !== undefined
+          ? `Active party: #${snap.partyId} (${snap.memberCount} live, seq=${snap.cursorSeq}, buffered=${snap.messages.length})`
+          : "Active party: none discovered",
+      ];
+      if (snap.lastError) lines.push(`Last error: ${redactUrlFragments(snap.lastError)}`);
+      await showAlertOrToast(this.context, "Multiplayer Party Panel", lines.join("\n"), "info");
+      return;
+    }
+
+    if (arg === "sidebar") {
+      const enabled = this.toggleSidebar();
+      this.context.ui.toast.show({
+        title: "Multiplayer Party Sidebar",
+        message: enabled
+          ? "Live Party Chat sidebar feed enabled (bounded party wait)."
+          : "Live Party Chat sidebar feed stopped.",
+        variant: "info",
+        duration: 4000,
+      });
+      return;
+    }
+
+    if (arg === "off" || arg === "close" || arg === "hide" || arg === "stop") {
+      this.closePanel(true);
+      this.context.ui.toast.show({
+        title: "Multiplayer Party Panel",
+        message: "Closed Party Chat panel and stopped background feed.",
+        variant: "info",
+        duration: 3500,
+      });
+      return;
+    }
+
+    if (arg === "on" || arg === "open" || arg === "show" || arg === "full" || arg === "fullscreen") {
+      const presentation = arg === "full" || arg === "fullscreen" ? "fullscreen" : "panel";
+      const opened = await this.openPanel(presentation);
+      if (!opened) {
+        await runPartyRead(this.context);
+      }
+      return;
+    }
+
+    if (arg === "" || arg === "toggle") {
+      if (this.isPanelActiveInHost()) {
+        this.closePanel(false);
+        this.context.ui.toast.show({
+          title: "Multiplayer Party Panel",
+          message: this.state.sidebarOpen
+            ? "Closed Party Chat panel (sidebar feed still active)."
+            : "Closed Party Chat panel.",
+          variant: "info",
+          duration: 3000,
+        });
+        return;
+      }
+      const opened = await this.openPanel("panel");
+      if (!opened) {
+        await runPartyRead(this.context);
+      }
+      return;
+    }
+
+    this.context.ui.toast.show({
+      title: "Multiplayer Party Panel",
+      message: "Usage: /party-panel [on|off|full|sidebar|status]",
+      variant: "warning",
+      duration: 5000,
+    });
+  }
+
+  dispose(): void {
+    this.closePanel(true);
+    this.uiListeners.clear();
+  }
+}
+
+function statusDotColor(status: PartyFeedSnapshot["status"], colors: ReturnType<typeof themeColors>): string {
+  switch (status) {
+    case "live":
+      return colors.success;
+    case "connecting":
+    case "reconnecting":
+      return colors.warning;
+    case "error":
+      return colors.error;
+    default:
+      return colors.muted;
+  }
+}
+
+function statusLabel(snap: PartyFeedSnapshot): string {
+  switch (snap.status) {
+    case "live":
+      return snap.partyId !== undefined
+        ? `Live · #${snap.partyId} · ${snap.memberCount} online · seq ${snap.cursorSeq}`
+        : "Live";
+    case "connecting":
+      return "Connecting to active party…";
+    case "reconnecting":
+      return snap.lastError ? `Reconnecting (${snap.lastError})` : "Reconnecting…";
+    case "no_party":
+      return "No active party — join via /party or mp-outpost";
+    case "error":
+      return snap.lastError ? `Error: ${snap.lastError}` : "Feed error";
+    default:
+      return "Idle";
+  }
+}
+
+function buildPartyPanelView(
+  rt: LoadedOpenTuiRuntime,
+  context: OpenCodeTuiContext,
+  controller: PartyPanelController,
+  options: {
+    panel?: OpenCodeTuiPanelInput;
+    onClose: () => void;
+    fullscreenOverlay?: boolean;
+  },
+): unknown {
+  const { solid, opentui: ui } = rt;
+  const [snap, setSnap] = solid.createSignal<PartyFeedSnapshot>(controller.feed.getSnapshot());
+  const [uiState, setUiState] = solid.createSignal<PanelUiState>(controller.getState());
+  const unsubFeed = controller.feed.subscribe((next) => setSnap(next));
+  const unsubUi = controller.subscribeUi((next) => setUiState(next));
+
+  let scrollRef: ScrollboxLike | undefined;
+
+  controller.notifyPanelMounted(options.panel?.focused ?? true);
+
+  solid.createEffect(() => {
+    const focused = options.panel ? options.panel.focused === true : true;
+    controller.feed.setPanelFocused(focused);
+  });
+
+  solid.onCleanup(() => {
+    unsubFeed();
+    unsubUi();
+    controller.notifyPanelUnmounted();
+  });
+
+  const scrollByLines = (delta: number) => {
+    scrollRef?.scrollBy?.(delta);
+  };
+
+  // Register panel-scoped key bindings (active while focused, matching opencode.diffs).
+  if (typeof context.keymap?.layer === "function") {
+    context.keymap.layer(() => ({
+      commands: [
+        {
+          id: "multiplayer.panel.say",
+          title: "Send party message",
+          group: "Multiplayer",
+          bind: "s",
+          run() {
+            void runPartySay(context);
+          },
+        },
+        {
+          id: "multiplayer.panel.refresh",
+          title: "Refresh party feed",
+          group: "Multiplayer",
+          bind: "r",
+          run() {
+            controller.feed.refresh();
+          },
+        },
+        {
+          id: "multiplayer.panel.down",
+          title: "Scroll party chat down",
+          group: "Multiplayer",
+          bind: "j",
+          run() {
+            scrollByLines(3);
+          },
+        },
+        {
+          id: "multiplayer.panel.up",
+          title: "Scroll party chat up",
+          group: "Multiplayer",
+          bind: "k",
+          run() {
+            scrollByLines(-3);
+          },
+        },
+        {
+          id: "multiplayer.panel.top",
+          title: "Scroll to top of party chat",
+          group: "Multiplayer",
+          bind: "g",
+          run() {
+            scrollRef?.scrollTo?.(0);
+          },
+        },
+        {
+          id: "multiplayer.panel.bottom",
+          title: "Scroll to latest party message",
+          group: "Multiplayer",
+          bind: "G",
+          run() {
+            if (scrollRef && typeof scrollRef.scrollHeight === "number") {
+              scrollRef.scrollTo?.(scrollRef.scrollHeight);
+            }
+          },
+        },
+        {
+          id: "multiplayer.panel.fullscreen",
+          title: "Toggle party panel fullscreen",
+          group: "Multiplayer",
+          bind: "f",
+          enabled: () => typeof options.panel?.toggleFullscreen === "function",
+          run() {
+            options.panel?.toggleFullscreen?.();
+          },
+        },
+        {
+          id: "multiplayer.panel.close",
+          title: "Close party chat panel",
+          group: "Multiplayer",
+          bind: "q",
+          run() {
+            options.onClose();
+          },
+        },
+        {
+          id: "multiplayer.panel.escape",
+          title: "Close party chat panel",
+          group: "Multiplayer",
+          bind: "escape",
+          run() {
+            options.onClose();
+          },
+        },
+      ],
+    }));
+  }
+
+  const root = ui.createElement("box");
+  ui.setProp(root, "width", "100%");
+  ui.setProp(root, "height", "100%");
+  ui.setProp(root, "flexDirection", "column");
+  if (options.fullscreenOverlay) {
+    ui.setProp(root, "position", "absolute");
+    ui.setProp(root, "zIndex", 2500);
+    ui.setProp(root, "left", 0);
+    ui.setProp(root, "top", 0);
+  }
+  ui.effect(() => {
+    const c = themeColors(context.theme);
+    const isSidePanel = options.panel?.presentation === "panel";
+    ui.setProp(root, "backgroundColor", isSidePanel ? c.bgRaised : c.bg);
+  });
+
+  // Header bar
+  const header = ui.createElement("box");
+  ui.setProp(header, "flexDirection", "row");
+  ui.setProp(header, "justifyContent", "space-between");
+  ui.setProp(header, "paddingLeft", 2);
+  ui.setProp(header, "paddingRight", 2);
+  ui.setProp(header, "paddingTop", 1);
+  ui.setProp(header, "paddingBottom", 1);
+  ui.setProp(header, "gap", 1);
+  ui.setProp(header, "flexShrink", 0);
+  ui.setProp(header, "border", ["bottom"]);
+  ui.effect(() => ui.setProp(header, "borderColor", themeColors(context.theme).border));
+
+  const headerLeft = ui.createElement("box");
+  ui.setProp(headerLeft, "flexDirection", "row");
+  ui.setProp(headerLeft, "gap", 1);
+  ui.setProp(headerLeft, "flexGrow", 1);
+  ui.setProp(headerLeft, "minWidth", 0);
+
+  const statusDot = ui.createElement("text");
+  ui.setProp(statusDot, "flexShrink", 0);
+  ui.setProp(statusDot, "wrapMode", "none");
+  ui.insertNode(statusDot, ui.createTextNode("●"));
+  ui.effect(() => ui.setProp(statusDot, "fg", statusDotColor(snap().status, themeColors(context.theme))));
+
+  const titleText = ui.createElement("text");
+  ui.setProp(titleText, "flexShrink", 0);
+  ui.setProp(titleText, "wrapMode", "none");
+  const titleBold = ui.createElement("b");
+  ui.insertNode(titleText, titleBold);
+  ui.insert(titleBold, () => {
+    const s = snap();
+    return s.partyId !== undefined ? `Party #${s.partyId}` : "Multiplayer Party";
+  });
+  ui.effect(() => ui.setProp(titleText, "fg", themeColors(context.theme).fg));
+
+  const metaText = ui.createElement("text");
+  ui.setProp(metaText, "flexGrow", 1);
+  ui.setProp(metaText, "minWidth", 0);
+  ui.setProp(metaText, "wrapMode", "none");
+  ui.setProp(metaText, "truncate", true);
+  ui.insert(metaText, () => {
+    const s = snap();
+    const parts: string[] = [];
+    if (s.handle) parts.push(s.handle);
+    if (s.partyId !== undefined && s.memberCount > 0) parts.push(`${s.memberCount} live`);
+    return parts.length > 0 ? `· ${parts.join(" · ")}` : "";
+  });
+  ui.effect(() => ui.setProp(metaText, "fg", themeColors(context.theme).muted));
+
+  ui.insertNode(headerLeft, statusDot);
+  ui.insertNode(headerLeft, titleText);
+  ui.insertNode(headerLeft, metaText);
+
+  const headerActions = ui.createElement("box");
+  ui.setProp(headerActions, "flexDirection", "row");
+  ui.setProp(headerActions, "gap", 1);
+  ui.setProp(headerActions, "flexShrink", 0);
+
+  const makeActionLink = (label: () => string, onClick: () => void, accent = false) => {
+    const t = ui.createElement("text");
+    ui.setProp(t, "selectable", false);
+    ui.setProp(t, "flexShrink", 0);
+    ui.setProp(t, "wrapMode", "none");
+    ui.setProp(t, "onMouseUp", () => onClick());
+    ui.insert(t, label);
+    ui.effect(() => {
+      const c = themeColors(context.theme);
+      ui.setProp(t, "fg", accent ? c.interactive : c.muted);
+    });
+    return t;
+  };
+
+  ui.insertNode(
+    headerActions,
+    makeActionLink(() => "[say]", () => void runPartySay(context), true),
+  );
+  if (typeof options.panel?.toggleFullscreen === "function") {
+    ui.insertNode(
+      headerActions,
+      makeActionLink(
+        () => (options.panel?.presentation === "fullscreen" ? "[split]" : "[full]"),
+        () => options.panel?.toggleFullscreen?.(),
+      ),
+    );
+  }
+  ui.insertNode(
+    headerActions,
+    makeActionLink(() => "[×]", () => options.onClose()),
+  );
+
+  ui.insertNode(header, headerLeft);
+  ui.insertNode(header, headerActions);
+
+  // Provenance / hint sub-header
+  const banner = ui.createElement("box");
+  ui.setProp(banner, "paddingLeft", 2);
+  ui.setProp(banner, "paddingRight", 2);
+  ui.setProp(banner, "paddingTop", 0);
+  ui.setProp(banner, "paddingBottom", 1);
+  ui.setProp(banner, "flexShrink", 0);
+  const bannerText = ui.createElement("text");
+  ui.setProp(bannerText, "wrapMode", "none");
+  ui.setProp(bannerText, "truncate", true);
+  ui.insert(bannerText, () => {
+    const s = snap();
+    return s.gapNotice
+      ? `UNTRUSTED EXTERNAL DATA · ${s.gapNotice}`
+      : "UNTRUSTED EXTERNAL DATA · [s] say  [r] refresh  [j/k] scroll  [q/esc] close";
+  });
+  ui.effect(() => {
+    const c = themeColors(context.theme);
+    ui.setProp(bannerText, "fg", snap().gapNotice ? c.warning : c.muted);
+  });
+  ui.insertNode(banner, bannerText);
+
+  // Scrollable message feed
+  const scrollbox = ui.createElement("scrollbox");
+  ui.setProp(scrollbox, "id", "multiplayer-party-scroll");
+  ui.setProp(scrollbox, "flexGrow", 1);
+  ui.setProp(scrollbox, "minHeight", 0);
+  ui.setProp(scrollbox, "minWidth", 0);
+  ui.setProp(scrollbox, "stickyScroll", true);
+  ui.setProp(scrollbox, "stickyStart", "bottom");
+  ui.setProp(scrollbox, "horizontalScrollbarOptions", { visible: false });
+  if (typeof ui.use === "function") {
+    ui.use((el: unknown) => {
+      scrollRef = el as ScrollboxLike;
+    }, scrollbox);
+  } else {
+    scrollRef = scrollbox as unknown as ScrollboxLike;
+  }
+
+  const listContainer = ui.createElement("box");
+  ui.setProp(listContainer, "flexDirection", "column");
+  ui.setProp(listContainer, "paddingLeft", 2);
+  ui.setProp(listContainer, "paddingRight", 2);
+  ui.setProp(listContainer, "gap", 1);
+
+  // Empty / loading / error placeholder when 0 messages
+  ui.insert(
+    listContainer,
+    ui.createComponent(solid.Show, {
+      get when() {
+        return snap().messages.length === 0;
+      },
+      get children() {
+        const emptyBox = ui.createElement("box");
+        ui.setProp(emptyBox, "paddingTop", 1);
+        const emptyText = ui.createElement("text");
+        ui.setProp(emptyText, "wrapMode", "word");
+        ui.insert(emptyText, () => {
+          const s = snap();
+          if (s.status === "connecting") return "Connecting to active multiplayer.tech party…";
+          if (s.status === "no_party") return "No active multiplayer party. Join a party via mp-outpost or /party.";
+          if (s.status === "error" || s.lastError) return `Feed error: ${s.lastError ?? "unable to reach mp-outpost"}`;
+          return "No recent chat messages yet. Press [s] or run /party-say to send one.";
+        });
+        ui.effect(() => {
+          const c = themeColors(context.theme);
+          const s = snap();
+          ui.setProp(emptyText, "fg", s.status === "error" ? c.error : c.muted);
+        });
+        ui.insertNode(emptyBox, emptyText);
+        return emptyBox;
+      },
+    }),
+  );
+
+  // Message list
+  ui.insert(
+    listContainer,
+    ui.createComponent(solid.For, {
+      get each() {
+        return snap().messages;
+      },
+      children: (msg: PartyChatMessage) => {
+        const row = ui.createElement("box");
+        ui.setProp(row, "flexDirection", "column");
+        ui.setProp(row, "flexShrink", 0);
+
+        const metaRow = ui.createElement("box");
+        ui.setProp(metaRow, "flexDirection", "row");
+        ui.setProp(metaRow, "gap", 1);
+
+        const seqText = ui.createElement("text");
+        ui.setProp(seqText, "flexShrink", 0);
+        ui.setProp(seqText, "wrapMode", "none");
+        ui.insertNode(seqText, ui.createTextNode(`#${msg.seq}`));
+        ui.effect(() => ui.setProp(seqText, "fg", themeColors(context.theme).muted));
+
+        const handleText = ui.createElement("text");
+        ui.setProp(handleText, "flexShrink", 0);
+        ui.setProp(handleText, "wrapMode", "none");
+        const handleBold = ui.createElement("b");
+        ui.insertNode(handleText, handleBold);
+        ui.insertNode(handleBold, ui.createTextNode(msg.handle));
+        ui.effect(() => {
+          const c = themeColors(context.theme);
+          ui.setProp(handleText, "fg", msg.isBrowser ? c.warning : msg.isOwn ? c.success : c.accent);
+        });
+
+        ui.insertNode(metaRow, seqText);
+        ui.insertNode(metaRow, handleText);
+
+        if (msg.isBrowser) {
+          const browserBadge = ui.createElement("text");
+          ui.setProp(browserBadge, "flexShrink", 0);
+          ui.setProp(browserBadge, "wrapMode", "none");
+          ui.insertNode(browserBadge, ui.createTextNode("[browser]"));
+          ui.effect(() => ui.setProp(browserBadge, "fg", themeColors(context.theme).warning));
+          ui.insertNode(metaRow, browserBadge);
+        }
+
+        if (msg.isCard) {
+          const cardBadge = ui.createElement("text");
+          ui.setProp(cardBadge, "flexShrink", 0);
+          ui.setProp(cardBadge, "wrapMode", "none");
+          ui.insertNode(cardBadge, ui.createTextNode("[card]"));
+          ui.effect(() => ui.setProp(cardBadge, "fg", themeColors(context.theme).info));
+          ui.insertNode(metaRow, cardBadge);
+        }
+
+        if (msg.timestamp) {
+          const tsText = ui.createElement("text");
+          ui.setProp(tsText, "flexShrink", 0);
+          ui.setProp(tsText, "wrapMode", "none");
+          ui.insertNode(tsText, ui.createTextNode(msg.timestamp));
+          ui.effect(() => ui.setProp(tsText, "fg", themeColors(context.theme).muted));
+          ui.insertNode(metaRow, tsText);
+        }
+
+        const bodyText = ui.createElement("text");
+        ui.setProp(bodyText, "wrapMode", "word");
+        ui.setProp(bodyText, "paddingLeft", 2);
+        ui.insertNode(bodyText, ui.createTextNode(msg.body));
+        ui.effect(() => ui.setProp(bodyText, "fg", themeColors(context.theme).fg));
+
+        ui.insertNode(row, metaRow);
+        ui.insertNode(row, bodyText);
+        return row;
+      },
+    }),
+  );
+
+  ui.insertNode(scrollbox, listContainer);
+
+  // Footer bar
+  const footer = ui.createElement("box");
+  ui.setProp(footer, "flexDirection", "row");
+  ui.setProp(footer, "justifyContent", "space-between");
+  ui.setProp(footer, "paddingLeft", 2);
+  ui.setProp(footer, "paddingRight", 2);
+  ui.setProp(footer, "paddingTop", 1);
+  ui.setProp(footer, "paddingBottom", 1);
+  ui.setProp(footer, "gap", 1);
+  ui.setProp(footer, "flexShrink", 0);
+  ui.setProp(footer, "border", ["top"]);
+  ui.effect(() => ui.setProp(footer, "borderColor", themeColors(context.theme).border));
+
+  const footerStatus = ui.createElement("text");
+  ui.setProp(footerStatus, "flexGrow", 1);
+  ui.setProp(footerStatus, "minWidth", 0);
+  ui.setProp(footerStatus, "wrapMode", "none");
+  ui.setProp(footerStatus, "truncate", true);
+  ui.insert(footerStatus, () => {
+    const s = snap();
+    return `${statusLabel(s)} · ${s.messages.length} msg${s.messages.length === 1 ? "" : "s"}`;
+  });
+  ui.effect(() => {
+    const c = themeColors(context.theme);
+    const s = snap();
+    ui.setProp(footerStatus, "fg", s.status === "error" ? c.error : c.muted);
+  });
+
+  const footerActions = ui.createElement("box");
+  ui.setProp(footerActions, "flexDirection", "row");
+  ui.setProp(footerActions, "gap", 1);
+  ui.setProp(footerActions, "flexShrink", 0);
+  ui.insertNode(
+    footerActions,
+    makeActionLink(() => "[refresh]", () => controller.feed.refresh()),
+  );
+  ui.insertNode(
+    footerActions,
+    makeActionLink(
+      () => (uiState().sidebarOpen ? "[sidebar:on]" : "[sidebar:off]"),
+      () => {
+        controller.toggleSidebar();
+      },
+    ),
+  );
+
+  ui.insertNode(footer, footerStatus);
+  ui.insertNode(footer, footerActions);
+
+  ui.insertNode(root, header);
+  ui.insertNode(root, banner);
+  ui.insertNode(root, scrollbox);
+  ui.insertNode(root, footer);
+
+  return root;
+}
+
+function buildSidebarWidget(
+  rt: LoadedOpenTuiRuntime,
+  context: OpenCodeTuiContext,
+  controller: PartyPanelController,
+): unknown {
+  const { solid, opentui: ui } = rt;
+  const [snap, setSnap] = solid.createSignal<PartyFeedSnapshot>(controller.feed.getSnapshot());
+  const [uiState, setUiState] = solid.createSignal<PanelUiState>(controller.getState());
+  const unsubFeed = controller.feed.subscribe((next) => setSnap(next));
+  const unsubUi = controller.subscribeUi((next) => setUiState(next));
+  solid.onCleanup(() => {
+    unsubFeed();
+    unsubUi();
+  });
+
+  return ui.createComponent(solid.Show, {
+    get when() {
+      return uiState().sidebarOpen;
+    },
+    get children() {
+      const container = ui.createElement("box");
+      ui.setProp(container, "flexDirection", "column");
+      ui.setProp(container, "flexShrink", 0);
+      ui.setProp(container, "gap", 0);
+
+      // Collapsible section header matching opencode.sidebar.mcp
+      const headerRow = ui.createElement("box");
+      ui.setProp(headerRow, "flexDirection", "row");
+      ui.setProp(headerRow, "gap", 1);
+      ui.setProp(headerRow, "onMouseDown", () => controller.toggleSidebarExpanded());
+
+      const chevron = ui.createElement("text");
+      ui.setProp(chevron, "flexShrink", 0);
+      ui.insert(chevron, () => (uiState().sidebarExpanded ? "▼" : "▶"));
+      ui.effect(() => ui.setProp(chevron, "fg", themeColors(context.theme).fg));
+
+      const dot = ui.createElement("text");
+      ui.setProp(dot, "flexShrink", 0);
+      ui.insertNode(dot, ui.createTextNode("●"));
+      ui.effect(() => ui.setProp(dot, "fg", statusDotColor(snap().status, themeColors(context.theme))));
+
+      const heading = ui.createElement("text");
+      ui.setProp(heading, "flexGrow", 1);
+      ui.setProp(heading, "minWidth", 0);
+      ui.setProp(heading, "wrapMode", "none");
+      ui.setProp(heading, "truncate", true);
+      const headingBold = ui.createElement("b");
+      ui.insertNode(heading, headingBold);
+      ui.insertNode(headingBold, ui.createTextNode("Party Chat"));
+      const countSpan = ui.createElement("span");
+      ui.insert(countSpan, () => {
+        const s = snap();
+        return s.partyId !== undefined ? ` (#${s.partyId})` : "";
+      });
+      ui.effect(() => ui.setProp(countSpan, "style", { fg: themeColors(context.theme).muted }));
+      ui.insertNode(heading, countSpan);
+      ui.effect(() => ui.setProp(heading, "fg", themeColors(context.theme).fg));
+
+      ui.insertNode(headerRow, chevron);
+      ui.insertNode(headerRow, dot);
+      ui.insertNode(headerRow, heading);
+      ui.insertNode(container, headerRow);
+
+      // Body when expanded
+      ui.insert(
+        container,
+        ui.createComponent(solid.Show, {
+          get when() {
+            return uiState().sidebarExpanded;
+          },
+          get children() {
+            const body = ui.createElement("box");
+            ui.setProp(body, "flexDirection", "column");
+            ui.setProp(body, "paddingLeft", 2);
+            ui.setProp(body, "gap", 0);
+
+            const note = ui.createElement("text");
+            ui.setProp(note, "wrapMode", "none");
+            ui.setProp(note, "truncate", true);
+            ui.insert(note, () => {
+              const s = snap();
+              if (s.status === "connecting") return "Connecting…";
+              if (s.status === "no_party") return "No active party";
+              if (s.status === "error") return s.lastError ?? "Feed error";
+              return `UNTRUSTED DATA · seq ${s.cursorSeq}`;
+            });
+            ui.effect(() => {
+              const c = themeColors(context.theme);
+              ui.setProp(note, "fg", snap().status === "error" ? c.error : c.muted);
+            });
+            ui.insertNode(body, note);
+
+            ui.insert(
+              body,
+              ui.createComponent(solid.For, {
+                get each() {
+                  return snap().messages.slice(-8);
+                },
+                children: (msg: PartyChatMessage) => {
+                  const line = ui.createElement("text");
+                  ui.setProp(line, "wrapMode", "none");
+                  ui.setProp(line, "truncate", true);
+                  const singleLineBody = sanitizeSingleLine(msg.body);
+                  const tag = msg.isBrowser ? " [web]" : "";
+                  ui.insertNode(line, ui.createTextNode(`${msg.handle}${tag}: ${singleLineBody}`));
+                  ui.effect(() => {
+                    const c = themeColors(context.theme);
+                    ui.setProp(line, "fg", msg.isBrowser ? c.warning : c.fg);
+                  });
+                  return line;
+                },
+              }),
+            );
+
+            const actions = ui.createElement("box");
+            ui.setProp(actions, "flexDirection", "row");
+            ui.setProp(actions, "gap", 1);
+
+            const mkBtn = (label: string, onClick: () => void, accent = false) => {
+              const t = ui.createElement("text");
+              ui.setProp(t, "selectable", false);
+              ui.setProp(t, "wrapMode", "none");
+              ui.setProp(t, "onMouseUp", onClick);
+              ui.insertNode(t, ui.createTextNode(label));
+              ui.effect(() => {
+                const c = themeColors(context.theme);
+                ui.setProp(t, "fg", accent ? c.interactive : c.muted);
+              });
+              return t;
+            };
+
+            ui.insertNode(
+              actions,
+              mkBtn("[panel]", () => void controller.openPanel("panel"), true),
+            );
+            ui.insertNode(
+              actions,
+              mkBtn("[say]", () => void runPartySay(context)),
+            );
+            ui.insertNode(
+              actions,
+              mkBtn("[stop]", () => controller.toggleSidebar()),
+            );
+            ui.insertNode(body, actions);
+            return body;
+          },
+        }),
+      );
+
+      return container;
+    },
+  });
+}
+
+function buildFooterStatusIndicator(
+  rt: LoadedOpenTuiRuntime,
+  context: OpenCodeTuiContext,
+  controller: PartyPanelController,
+): unknown {
+  const { solid, opentui: ui } = rt;
+  const [snap, setSnap] = solid.createSignal<PartyFeedSnapshot>(controller.feed.getSnapshot());
+  const unsubFeed = controller.feed.subscribe((next) => setSnap(next));
+  solid.onCleanup(() => unsubFeed());
+
+  return ui.createComponent(solid.Show, {
+    get when() {
+      return snap().running;
+    },
+    get children() {
+      const box = ui.createElement("box");
+      ui.setProp(box, "flexShrink", 0);
+      ui.setProp(box, "flexDirection", "row");
+      ui.setProp(box, "gap", 1);
+      ui.setProp(box, "onMouseUp", () => void controller.handlePanelCommand("toggle"));
+
+      const dot = ui.createElement("text");
+      ui.setProp(dot, "flexShrink", 0);
+      ui.setProp(dot, "wrapMode", "none");
+      ui.insertNode(dot, ui.createTextNode("●"));
+      ui.effect(() => ui.setProp(dot, "fg", statusDotColor(snap().status, themeColors(context.theme))));
+
+      const label = ui.createElement("text");
+      ui.setProp(label, "flexShrink", 0);
+      ui.setProp(label, "wrapMode", "none");
+      ui.insert(label, () => {
+        const s = snap();
+        const base = s.partyId !== undefined ? `party #${s.partyId}` : "party";
+        return s.unreadCount > 0 ? `${base} (${s.unreadCount} new)` : base;
+      });
+      ui.effect(() => {
+        const c = themeColors(context.theme);
+        const s = snap();
+        ui.setProp(label, "fg", s.unreadCount > 0 ? c.interactive : c.muted);
+      });
+
+      ui.insertNode(box, dot);
+      ui.insertNode(box, label);
+      return box;
+    },
+  });
+}
+
+async function mountNativePanelSlots(
+  context: OpenCodeTuiContext,
+  controller: PartyPanelController,
+  isDisposed: () => boolean,
+  cleanups: Array<() => void>,
+): Promise<void> {
+  const rt = await loadOpenTuiRuntime();
+  if (!rt || isDisposed()) return;
+  if (typeof context.ui?.slot !== "function") return;
+
+  controller.markNativeRuntimeLoaded();
+
+  // 1. Full-height live session.panel slot
+  const unsubPanelSlot = context.ui.slot({
+    append: "session.panel",
+    render(rawInput) {
+      const panelInput = (rawInput ?? {}) as unknown as OpenCodeTuiPanelInput;
+      return rt.opentui.createComponent(rt.solid.Show, {
+        get when() {
+          return panelInput.name === PARTY_PANEL_NAME;
+        },
+        get children() {
+          return buildPartyPanelView(rt, context, controller, {
+            panel: panelInput,
+            onClose: () => {
+              if (typeof panelInput.close === "function") {
+                panelInput.close();
+              } else {
+                controller.closePanel(false);
+              }
+            },
+          });
+        },
+      });
+    },
+  });
+  if (typeof unsubPanelSlot === "function") cleanups.push(unsubPanelSlot);
+
+  // 2. Fallback standalone plugin route when opened from OpenCode's "home" screen
+  if (typeof context.ui?.router?.register === "function") {
+    try {
+      const unsubRoute = context.ui.router.register({
+        name: PARTY_PANEL_NAME,
+        render({ data }) {
+          const returnRoute = (data?.returnRoute as OpenCodeTuiRoute | undefined) ?? { type: "home" };
+          return buildPartyPanelView(rt, context, controller, {
+            fullscreenOverlay: true,
+            onClose: () => {
+              controller.closePanel(false);
+              context.ui.router?.navigate(returnRoute);
+            },
+          });
+        },
+      });
+      if (typeof unsubRoute === "function") cleanups.push(unsubRoute);
+    } catch {
+      // ignore if route already registered
+    }
+  }
+
+  // 3. Collapsible live sidebar.content widget
+  const unsubSidebarSlot = context.ui.slot({
+    append: "sidebar.content",
+    render() {
+      return buildSidebarWidget(rt, context, controller);
+    },
+  });
+  if (typeof unsubSidebarSlot === "function") cleanups.push(unsubSidebarSlot);
+
+  // 4. Compact prompt.footer.status live indicator (only visible while feed runs)
+  const unsubFooterSlot = context.ui.slot({
+    append: "prompt.footer.status",
+    render() {
+      return buildFooterStatusIndicator(rt, context, controller);
+    },
+  });
+  if (typeof unsubFooterSlot === "function") cleanups.push(unsubFooterSlot);
+}
+
+async function runPartyMenu(context: OpenCodeTuiContext, controller: PartyPanelController): Promise<void> {
   if (typeof context.ui?.dialog?.select !== "function") {
     await runOpenChat(context);
     return;
   }
 
+  const panelOpen = controller.isPanelActiveInHost();
+  const sidebarOpen = controller.getState().sidebarOpen;
+
   const choice = await context.ui.dialog.select({
     title: "Multiplayer (multiplayer.tech)",
     placeholder: "Choose a Multiplayer action...",
     options: [
+      {
+        title: panelOpen ? "Close Live Party Chat Panel" : "Open Live Party Chat Panel (native)",
+        description: panelOpen
+          ? "Close the live OpenCode party chat panel"
+          : "Display live party chat natively inside OpenCode (session panel)",
+        value: "panel",
+      },
+      {
+        title: sidebarOpen ? "Stop Sidebar Party Feed" : "Toggle Live Sidebar Party Feed",
+        description: sidebarOpen
+          ? "Hide sidebar feed and stop background party wait"
+          : "Show a compact live party feed in the OpenCode session sidebar",
+        value: "sidebar",
+      },
       {
         title: "Open Party Chat (detached phux window)",
         description: "Start or reuse detached mp-outpost chat via phux/tmux/Omarchy",
@@ -758,6 +1782,12 @@ async function runPartyMenu(context: OpenCodeTuiContext): Promise<void> {
   });
 
   switch (choice) {
+    case "panel":
+      await controller.handlePanelCommand("toggle");
+      break;
+    case "sidebar":
+      await controller.handlePanelCommand("sidebar");
+      break;
     case "chat":
       await runOpenChat(context);
       break;
@@ -782,8 +1812,12 @@ async function runPartyMenu(context: OpenCodeTuiContext): Promise<void> {
 }
 
 const tuiPlugin = {
-  id: "antimeme-ai.multiplayer",
-  setup(context: OpenCodeTuiContext): void {
+  id: "antimeme.multiplayer",
+  setup(context: OpenCodeTuiContext): () => void {
+    let disposed = false;
+    const cleanups: Array<() => void> = [];
+    const controller = new PartyPanelController(context);
+
     const registerLayer = () => {
       context.keymap.layer(() => ({
         mode: "global",
@@ -791,14 +1825,26 @@ const tuiPlugin = {
           {
             id: "multiplayer.menu",
             title: "Multiplayer Party Menu",
-            description: "Open quick Multiplayer menu (chat, say, read, status, friends, listen)",
+            description: "Open quick Multiplayer menu (panel, sidebar, chat, say, read, status, friends, listen)",
             group: "Multiplayer",
             bind: "ctrl+alt+m",
             palette: true,
             slash: { name: "party", aliases: ["mp"] },
             suggested: true,
             async run() {
-              await runPartyMenu(context);
+              await runPartyMenu(context, controller);
+            },
+          },
+          {
+            id: "multiplayer.panel",
+            title: "Toggle Multiplayer Party Chat Panel",
+            description: "Show or hide the native live Party Chat display panel (args: on|off|full|sidebar|status)",
+            group: "Multiplayer",
+            palette: true,
+            slash: { name: "party-panel", aliases: ["mp-panel"], arguments: true },
+            suggested: true,
+            async run(input?: string) {
+              await controller.handlePanelCommand(input);
             },
           },
           {
@@ -852,13 +1898,27 @@ const tuiPlugin = {
     };
 
     if (typeof context.ui?.slot === "function") {
-      context.ui.slot({
+      const unsubApp = context.ui.slot({
         append: "app",
         render: registerLayer,
       });
+      if (typeof unsubApp === "function") cleanups.push(unsubApp);
+      void mountNativePanelSlots(context, controller, () => disposed, cleanups);
     } else {
       registerLayer();
     }
+
+    return () => {
+      disposed = true;
+      controller.dispose();
+      for (const fn of cleanups.splice(0).reverse()) {
+        try {
+          fn();
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+    };
   },
 };
 

@@ -1,5 +1,5 @@
 {
-  "name": "@antimeme-ai/opencode-multiplayer",
+  "name": "@antimeme/opencode-multiplayer",
   "version": "0.7.1",
   "description": "OpenCode v2 plugin wiring mp-outpost local MCP server (18 mp2 party, listen & async E2EE inbox tools) with pre-exec secret refusal and TUI party-chat launcher for multiplayer.tech.",
   "license": "MIT",

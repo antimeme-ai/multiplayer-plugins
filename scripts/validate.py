@@ -239,14 +239,14 @@ def _validate_manifest_references(errors: list[str]) -> None:
     opencode_pkg = _load_json_strict(opencode_pkg_path)
     if "main" in opencode_pkg:
         _check_rel_path(opencode_pkg_path.parent, opencode_pkg["main"], opencode_pkg_path, errors)
-    opencode_src = (opencode_pkg_path.parent / opencode_pkg["main"]).read_text(encoding="utf-8")
-    if re.search(r"\bconsole\.(?:log|warn|error|info|debug)\s*\(", opencode_src):
-        errors.append("adapters/opencode/src/index.ts: must not call console.* (corrupts OpenCode TUI)")
-    opencode_tui_path = opencode_pkg_path.parent / "src" / "tui.ts"
-    if opencode_tui_path.is_file():
-        opencode_tui_src = opencode_tui_path.read_text(encoding="utf-8")
-        if re.search(r"\bconsole\.(?:log|warn|error|info|debug)\s*\(", opencode_tui_src):
-            errors.append("adapters/opencode/src/tui.ts: must not call console.* (corrupts OpenCode TUI)")
+    opencode_src_dir = opencode_pkg_path.parent / "src"
+    if opencode_src_dir.is_dir():
+        for ts_path in sorted(opencode_src_dir.glob("*.ts")):
+            ts_src = ts_path.read_text(encoding="utf-8")
+            if re.search(r"\bconsole\.(?:log|warn|error|info|debug)\s*\(", ts_src):
+                errors.append(
+                    f"{ts_path.relative_to(REPO_ROOT)}: must not call console.* (corrupts OpenCode TUI)"
+                )
 
     # 7. Pi adapter
     pi_pkg_path = REPO_ROOT / "adapters" / "pi" / "package.json"

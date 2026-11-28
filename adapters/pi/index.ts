@@ -4,9 +4,12 @@
  * - Compatible with upstream Pi (`@earendil-works/pi-coding-agent`) and Oh-My-Pi
  *   (`@oh-my-pi/pi-coding-agent`): uses `ctx.ui.notify(...)` (with `ctx.notify`
  *   fallback) and `(event, ctx)` event handler signatures.
- * - Registers all 18 LLM-callable tools via `pi.registerTool(...)` plus 11
- *   interactive slash commands via `pi.registerCommand(...)`, `tool_call` pre-exec
- *   secret refusal, and `before_agent_start` provenance guidance.
+ * - Registers all 18 LLM-callable tools via `pi.registerTool(...)` plus 13
+ *   interactive slash commands via `pi.registerCommand(...)` (including live
+ *   docked widget `/party-panel` and interactive overlay `/party-overlay`),
+ *   keyboard shortcuts (`ctrl+shift+p` detached phux, `ctrl+shift+m` native
+ *   overlay), `tool_call` pre-exec secret refusal, `before_agent_start`
+ *   provenance guidance, and `session_shutdown` watcher cleanup.
  * - Uses `spawn(..., { shell: false })` exclusively (zero shell interpolation),
  *   refuses outbound secret material (including mpinv1_, mppi1_, mpcs1_, mpguest1_,
  *   mpdl1_, mprk1_ + unprefixed 55-char Crockford checksum keys, PEM, .mpkey,
@@ -335,9 +338,160 @@ export function validateSafePositionalArg(label: string, raw: string): { value?:
   return { value: cleaned };
 }
 
-export function sanitizePeerText(raw: string): string {
+const ANSI_ESCAPE_RE =
+  /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[P_][^\x07\x1b]*(?:\x07|\x1b\\))/g;
+
+export function stripAnsi(raw: string): string {
+  return raw.replace(ANSI_ESCAPE_RE, "");
+}
+
+function isZeroWidthCodePoint(cp: number): boolean {
+  return (
+    cp === 0x00ad ||
+    (cp >= 0x0300 && cp <= 0x036f) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x200b && cp <= 0x200f) ||
+    (cp >= 0x2028 && cp <= 0x202e) ||
+    (cp >= 0x2060 && cp <= 0x206f) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f) ||
+    cp === 0xfeff ||
+    (cp >= 0xe0100 && cp <= 0xe01ef)
+  );
+}
+
+function isWideCodePoint(cp: number): boolean {
+  return (
+    cp >= 0x1100 &&
+    (cp <= 0x115f ||
+      cp === 0x2329 ||
+      cp === 0x232a ||
+      (cp >= 0x2e80 && cp <= 0x303e) ||
+      (cp >= 0x3040 && cp <= 0xa4cf) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xfe10 && cp <= 0xfe19) ||
+      (cp >= 0xfe30 && cp <= 0xfe6f) ||
+      (cp >= 0xff00 && cp <= 0xff60) ||
+      (cp >= 0xffe0 && cp <= 0xffe6) ||
+      (cp >= 0x1f300 && cp <= 0x1faff) ||
+      (cp >= 0x20000 && cp <= 0x3fffd))
+  );
+}
+
+function codePointDisplayWidth(cp: number): number {
+  if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f) || isZeroWidthCodePoint(cp)) return 0;
+  return isWideCodePoint(cp) ? 2 : 1;
+}
+
+export function visibleWidth(raw: string): number {
+  const plain = stripAnsi(raw);
+  let width = 0;
+  for (const ch of plain) {
+    width += codePointDisplayWidth(ch.codePointAt(0) ?? 0);
+  }
+  return width;
+}
+
+export function truncateAnsi(raw: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  if (visibleWidth(raw) <= maxWidth) return raw;
+  const ellipsis = maxWidth >= 2 ? "…" : "";
+  const limit = maxWidth - ellipsis.length;
   let out = "";
-  for (const ch of raw) {
+  let col = 0;
+  let hasAnsi = false;
+  let i = 0;
+  while (i < raw.length) {
+    if (raw.charCodeAt(i) === 0x1b) {
+      ANSI_ESCAPE_RE.lastIndex = i;
+      const m = ANSI_ESCAPE_RE.exec(raw);
+      if (m && m.index === i) {
+        out += m[0];
+        hasAnsi = true;
+        i += m[0].length;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    const cp = raw.codePointAt(i) ?? 0;
+    const ch = String.fromCodePoint(cp);
+    const w = codePointDisplayWidth(cp);
+    if (col + w > limit) break;
+    out += ch;
+    col += w;
+    i += ch.length;
+  }
+  return `${out}${ellipsis}${hasAnsi ? "\x1b[0m" : ""}`;
+}
+
+function padAnsi(raw: string, width: number): string {
+  if (width <= 0) return "";
+  const fitted = truncateAnsi(raw, width);
+  const pad = Math.max(0, width - visibleWidth(fitted));
+  return pad > 0 ? `${fitted}${" ".repeat(pad)}` : fitted;
+}
+
+function wrapPlainText(text: string, maxWidth: number): string[] {
+  const width = Math.max(1, maxWidth);
+  const out: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    if (!paragraph) {
+      out.push("");
+      continue;
+    }
+    let line = "";
+    let lineW = 0;
+    const tokens = paragraph.match(/\S+|\s+/g) ?? [paragraph];
+    for (const tok of tokens) {
+      const tokW = visibleWidth(tok);
+      if (lineW === 0 && /^\s+$/.test(tok)) {
+        continue;
+      }
+      if (lineW + tokW <= width) {
+        line += tok;
+        lineW += tokW;
+        continue;
+      }
+      if (lineW > 0) {
+        out.push(line.trimEnd());
+        line = "";
+        lineW = 0;
+        if (/^\s+$/.test(tok)) continue;
+      }
+      if (tokW <= width) {
+        line = tok;
+        lineW = tokW;
+      } else {
+        let chunk = "";
+        let chunkW = 0;
+        for (const ch of tok) {
+          const w = codePointDisplayWidth(ch.codePointAt(0) ?? 0);
+          if (chunkW + w > width && chunk) {
+            out.push(chunk);
+            chunk = ch;
+            chunkW = w;
+          } else {
+            chunk += ch;
+            chunkW += w;
+          }
+        }
+        line = chunk;
+        lineW = chunkW;
+      }
+    }
+    if (line || out.length === 0) out.push(line.trimEnd());
+  }
+  return out.length > 0 ? out : [""];
+}
+
+export function sanitizePeerText(raw: string): string {
+  const withoutAnsi = stripAnsi(raw);
+  let out = "";
+  for (const ch of withoutAnsi) {
     const cp = ch.codePointAt(0) ?? 0;
     if (ch === "\n" || ch === "\t") {
       out += ch;
@@ -685,9 +839,75 @@ async function resolveActivePartyId(explicitId: unknown, signal?: AbortSignal): 
   return (await resolveActivePartyInfo(undefined, signal)).partyId;
 }
 
+export interface PiTheme {
+  fg: (color: string, text: string) => string;
+  bg?: (color: string, text: string) => string;
+  bold: (text: string) => string;
+  italic?: (text: string) => string;
+}
+
+export interface PiTUI {
+  requestRender: (force?: boolean) => void;
+  terminal?: { rows?: number; columns?: number };
+}
+
+export interface PiComponent {
+  render: (width: number) => string[];
+  handleInput?: (data: string) => void;
+  invalidate: () => void;
+  dispose?: () => void;
+}
+
+export type PiWidgetPlacement = "aboveEditor" | "belowEditor";
+
+export interface PiWidgetOptions {
+  placement?: PiWidgetPlacement;
+}
+
+export type PiWidgetContent =
+  | string[]
+  | ((tui: PiTUI, theme: PiTheme) => PiComponent)
+  | undefined;
+
+export interface PiOverlayOptions {
+  anchor?:
+    | "center"
+    | "top-left"
+    | "top-right"
+    | "bottom-left"
+    | "bottom-right"
+    | "top-center"
+    | "bottom-center"
+    | "left-center"
+    | "right-center";
+  width?: number | `${number}%`;
+  minWidth?: number;
+  maxHeight?: number | `${number}%`;
+  margin?: number | { top?: number; right?: number; bottom?: number; left?: number };
+  offsetX?: number;
+  offsetY?: number;
+}
+
+export interface PiCustomOptions {
+  overlay?: boolean;
+  overlayOptions?: PiOverlayOptions | (() => PiOverlayOptions);
+  signal?: AbortSignal;
+}
+
 export interface PiUIContext {
   notify: (message: string, level?: "info" | "warning" | "error") => void;
   setStatus?: (key: string, text: string | undefined) => void;
+  setWidget?: (key: string, content: PiWidgetContent, options?: PiWidgetOptions) => void;
+  custom?: <T>(
+    factory: (
+      tui: PiTUI,
+      theme: PiTheme,
+      keybindings: unknown,
+      done: (result: T) => void,
+    ) => PiComponent | Promise<PiComponent>,
+    options?: PiCustomOptions,
+  ) => Promise<T>;
+  theme?: PiTheme;
 }
 
 export interface PiCommandContext {
@@ -1518,12 +1738,1329 @@ export async function launchDetachedPartyChat(options?: {
   };
 }
 
+export interface PartyFeedMessage {
+  seq: number;
+  kind: string;
+  handle: string;
+  isBrowser: boolean;
+  isOwnSent?: boolean;
+  body: string;
+  card?: { title: string; summary: string; status?: string };
+}
+
+export interface PartyFeedSnapshot {
+  running: boolean;
+  state: "stopped" | "connecting" | "live" | "reconnecting" | "idle" | "error";
+  partyId: number | null;
+  roomCode: string | null;
+  memberCount: number | null;
+  daemonEpoch: number | null;
+  ownHandle: string | null;
+  ownDeviceId: number | null;
+  nextSeq: number;
+  unreadCount: number;
+  lastError: string | null;
+  messages: readonly PartyFeedMessage[];
+}
+
+export interface PartyFeedWatcherOptions {
+  maxMessages?: number;
+  seedCount?: number;
+  waitTimeoutMs?: number;
+  backoffMs?: number;
+  partyId?: number;
+}
+
+const DEFAULT_FEED_MAX_MESSAGES = 100;
+const DEFAULT_FEED_SEED_COUNT = 15;
+const DEFAULT_FEED_WAIT_TIMEOUT_MS = 25_000;
+const DEFAULT_FEED_BACKOFF_MS = 1_500;
+const DOCKED_WIDGET_KEY = "multiplayer-chat";
+const DOCKED_WIDGET_MAX_MESSAGES = 6;
+
+function parseCardObject(raw: unknown): { title: string; summary: string; status?: string } | null {
+  let obj: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith("{")) return null;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+  const rec = obj as Record<string, unknown>;
+  if (typeof rec.title !== "string" || typeof rec.summary !== "string") return null;
+  const title = redactUrlFragments(sanitizeSingleLine(rec.title));
+  const summary = redactUrlFragments(sanitizeSingleLine(rec.summary));
+  if (!title && !summary) return null;
+  const status = typeof rec.status === "string" && rec.status.trim() ? sanitizeSingleLine(rec.status) : undefined;
+  return { title, summary, ...(status ? { status } : {}) };
+}
+
+function formatCardInline(card: { title: string; summary: string; status?: string }): string {
+  const statusTag = card.status ? ` (${card.status})` : "";
+  return `[card] ${card.title}${statusTag}: ${card.summary}`;
+}
+
+export function formatPartyFeedEvent(
+  ev: OutpostPartyEvent,
+  ownDeviceId: number | null,
+): PartyFeedMessage | null {
+  const isBrowser = isBrowserOriginEvent(ev);
+  if (
+    !isBrowser &&
+    ownDeviceId !== null &&
+    ownDeviceId > 0 &&
+    Number.isSafeInteger(ev.sender_device_id) &&
+    ev.sender_device_id === ownDeviceId
+  ) {
+    return null;
+  }
+
+  const seq = Number.isSafeInteger(ev.event_seq)
+    ? (ev.event_seq as number)
+    : Number.isSafeInteger(ev.seq)
+      ? (ev.seq as number)
+      : 0;
+  const kind = sanitizeSingleLine(String(ev.kind ?? "unknown")) || "unknown";
+  const rawHandle = sanitizeSingleLine(String(ev.sender_handle ?? ev.from ?? "peer")) || "peer";
+  const handle = rawHandle.startsWith("@") ? rawHandle : `@${rawHandle}`;
+
+  let card: { title: string; summary: string; status?: string } | undefined;
+  let body = "";
+
+  if (kind === "chat_message" || kind === "chat") {
+    body = redactUrlFragments(sanitizePeerText(String(ev.body ?? ev.text ?? ""))).trim();
+  } else if (kind === "agent_card") {
+    const parsed = parseCardObject(ev.body ?? ev.card ?? ev);
+    if (parsed) {
+      card = parsed;
+      body = formatCardInline(parsed);
+    } else {
+      body = redactUrlFragments(sanitizePeerText(String(ev.summary ?? ev.body ?? ev.text ?? ""))).trim();
+      if (body) body = `[card] ${body}`;
+    }
+  } else if (kind === "bridge_envelope") {
+    const decodedStr = tryDecodeAgentCardFromB64(String(ev.payload_b64 ?? ""));
+    const parsed = decodedStr ? parseCardObject(decodedStr) : null;
+    if (parsed) {
+      card = parsed;
+      body = formatCardInline(parsed);
+    } else {
+      const scope = sanitizeSingleLine(String(ev.room_scope ?? ""));
+      const b64 = sanitizeSingleLine(String(ev.payload_b64 ?? ""));
+      if (b64) {
+        body = scope ? `[board:${scope}] ${b64.slice(0, 64)}` : `[board] ${b64.slice(0, 64)}`;
+      }
+    }
+  } else if (kind === "control_notice") {
+    const notice = redactUrlFragments(sanitizePeerText(String(ev.text ?? ev.body ?? ""))).trim();
+    if (notice) body = `[notice] ${notice}`;
+  } else if (kind === "membership_changed" || kind === "system") {
+    const summary = redactUrlFragments(sanitizePeerText(String(ev.summary ?? ev.body ?? ev.text ?? ""))).trim();
+    if (summary) body = `[system] ${summary}`;
+  } else {
+    const fallback = redactUrlFragments(sanitizePeerText(String(ev.body ?? ev.text ?? ev.summary ?? ""))).trim();
+    if (fallback) body = `[${kind}] ${fallback}`;
+  }
+
+  if (!body) return null;
+  return {
+    seq,
+    kind,
+    handle,
+    isBrowser,
+    body,
+    ...(card ? { card } : {}),
+  };
+}
+
+function isInactivePartyError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    /\b4040\b/.test(lower) ||
+    lower.includes("is not active") ||
+    lower.includes("not in party") ||
+    lower.includes("party not found") ||
+    lower.includes("no active")
+  );
+}
+
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export class PartyFeedWatcher {
+  #maxMessages: number;
+  #seedCount: number;
+  #waitTimeoutMs: number;
+  #backoffMs: number;
+  #explicitPartyId: number | undefined;
+
+  #running = false;
+  #state: PartyFeedSnapshot["state"] = "stopped";
+  #partyId: number | null = null;
+  #roomCode: string | null = null;
+  #memberCount: number | null = null;
+  #daemonEpoch: number | null = null;
+  #ownHandle: string | null = null;
+  #ownDeviceId: number | null = null;
+  #nextSeq = 0;
+  #unreadCount = 0;
+  #lastError: string | null = null;
+  #messages: PartyFeedMessage[] = [];
+  #seenSeqs = new Set<number>();
+
+  #abortController: AbortController | null = null;
+  #loopPromise: Promise<void> | null = null;
+  #startPromise: Promise<PartyFeedSnapshot> | null = null;
+  #listeners = new Set<(snapshot: PartyFeedSnapshot) => void>();
+  #exitHandler: (() => void) | null = null;
+
+  constructor(options?: PartyFeedWatcherOptions) {
+    this.#maxMessages = Math.max(10, Math.trunc(options?.maxMessages ?? DEFAULT_FEED_MAX_MESSAGES));
+    this.#seedCount = Math.max(1, Math.min(100, Math.trunc(options?.seedCount ?? DEFAULT_FEED_SEED_COUNT)));
+    this.#waitTimeoutMs = Math.max(
+      0,
+      Math.min(MAX_WAIT_TIMEOUT_MS, Math.trunc(options?.waitTimeoutMs ?? DEFAULT_FEED_WAIT_TIMEOUT_MS)),
+    );
+    this.#backoffMs = Math.max(20, Math.trunc(options?.backoffMs ?? DEFAULT_FEED_BACKOFF_MS));
+    this.#explicitPartyId = options?.partyId;
+  }
+
+  get isRunning(): boolean {
+    return this.#running;
+  }
+
+  getSnapshot(): PartyFeedSnapshot {
+    return {
+      running: this.#running,
+      state: this.#state,
+      partyId: this.#partyId,
+      roomCode: this.#roomCode,
+      memberCount: this.#memberCount,
+      daemonEpoch: this.#daemonEpoch,
+      ownHandle: this.#ownHandle,
+      ownDeviceId: this.#ownDeviceId,
+      nextSeq: this.#nextSeq,
+      unreadCount: this.#unreadCount,
+      lastError: this.#lastError,
+      messages: [...this.#messages],
+    };
+  }
+
+  subscribe(listener: (snapshot: PartyFeedSnapshot) => void): () => void {
+    this.#listeners.add(listener);
+    return () => {
+      this.#listeners.delete(listener);
+    };
+  }
+
+  markRead(): void {
+    if (this.#unreadCount === 0) return;
+    this.#unreadCount = 0;
+    this.#notify();
+  }
+
+  recordLocalSent(body: string, seq?: number): void {
+    const clean = redactUrlFragments(sanitizePeerText(body)).trim();
+    if (!clean) return;
+    const rawHandle = this.#ownHandle ? sanitizeSingleLine(this.#ownHandle) : "me";
+    const handle = rawHandle.startsWith("@") ? rawHandle : `@${rawHandle}`;
+    const msgSeq = typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0 ? seq : 0;
+    if (msgSeq > 0) this.#seenSeqs.add(msgSeq);
+    this.#pushMessage({
+      seq: msgSeq,
+      kind: "chat",
+      handle,
+      isBrowser: false,
+      isOwnSent: true,
+      body: clean,
+    });
+    this.#notify();
+  }
+
+  async start(explicitPartyId?: number): Promise<PartyFeedSnapshot> {
+    if (explicitPartyId !== undefined) {
+      this.#explicitPartyId = explicitPartyId;
+    }
+    if (this.#running) {
+      if (this.#startPromise) return await this.#startPromise;
+      return this.getSnapshot();
+    }
+
+    this.#running = true;
+    this.#state = "connecting";
+    this.#lastError = null;
+    const ac = new AbortController();
+    this.#abortController = ac;
+
+    this.#exitHandler = () => {
+      this.stop();
+    };
+    process.once("exit", this.#exitHandler);
+
+    this.#notify();
+
+    const init = (async (): Promise<PartyFeedSnapshot> => {
+      await this.#resolveAndSeed(ac.signal);
+      if (this.#running && !ac.signal.aborted) {
+        this.#loopPromise = this.#runLoop(ac.signal);
+      }
+      return this.getSnapshot();
+    })();
+    this.#startPromise = init;
+    try {
+      return await init;
+    } finally {
+      if (this.#startPromise === init) this.#startPromise = null;
+    }
+  }
+
+  stop(): void {
+    if (!this.#running && !this.#abortController) return;
+    this.#running = false;
+    const ac = this.#abortController;
+    this.#abortController = null;
+    if (ac && !ac.signal.aborted) {
+      ac.abort();
+    }
+    if (this.#exitHandler) {
+      process.removeListener("exit", this.#exitHandler);
+      this.#exitHandler = null;
+    }
+    this.#state = "stopped";
+    this.#notify();
+  }
+
+  #notify(): void {
+    const snap = this.getSnapshot();
+    for (const listener of this.#listeners) {
+      try {
+        listener(snap);
+      } catch {
+        // Isolate subscriber errors from watcher loop.
+      }
+    }
+  }
+
+  #pushMessage(msg: PartyFeedMessage): void {
+    this.#messages.push(msg);
+    if (this.#messages.length > this.#maxMessages) {
+      this.#messages.splice(0, this.#messages.length - this.#maxMessages);
+    }
+    if (this.#seenSeqs.size > this.#maxMessages * 4) {
+      const recent = new Set<number>();
+      for (const m of this.#messages) {
+        if (m.seq > 0) recent.add(m.seq);
+      }
+      this.#seenSeqs = recent;
+    }
+  }
+
+  #ingestEvents(events: OutpostPartyEvent[], countAsUnread: boolean): boolean {
+    let changed = false;
+    for (const ev of events) {
+      if (!ev || typeof ev !== "object") continue;
+      const seq = Number.isSafeInteger(ev.event_seq)
+        ? (ev.event_seq as number)
+        : Number.isSafeInteger(ev.seq)
+          ? (ev.seq as number)
+          : 0;
+      if (seq > this.#nextSeq) {
+        this.#nextSeq = seq;
+      }
+      if (seq > 0 && this.#seenSeqs.has(seq)) {
+        continue;
+      }
+      if (seq > 0) {
+        this.#seenSeqs.add(seq);
+      }
+      const formatted = formatPartyFeedEvent(ev, this.#ownDeviceId);
+      if (!formatted) continue;
+      this.#pushMessage(formatted);
+      if (countAsUnread) {
+        this.#unreadCount += 1;
+      }
+      changed = true;
+    }
+    return changed;
+  }
+
+  async #resolveAndSeed(signal: AbortSignal): Promise<boolean> {
+    if (!this.#running || signal.aborted) return false;
+    const [listRes, statusRes] = await Promise.allSettled([
+      runOutpostJson(["party", "list"], { timeoutMs: 8_000, signal }),
+      runOutpostJson(["party", "status"], { timeoutMs: 8_000, signal }),
+    ]);
+
+    if (!this.#running || signal.aborted) return false;
+
+    if (statusRes.status === "fulfilled" && statusRes.value && typeof statusRes.value === "object") {
+      const st = statusRes.value as {
+        handle?: string;
+        device_id?: number;
+        own_device_id?: number;
+        active_party_room_code?: string;
+        active_party?: { room_code?: string };
+      };
+      if (typeof st.handle === "string" && st.handle.trim()) {
+        this.#ownHandle = sanitizeSingleLine(st.handle);
+      }
+      const devId = st.device_id ?? st.own_device_id;
+      if (typeof devId === "number" && Number.isSafeInteger(devId) && devId > 0) {
+        this.#ownDeviceId = devId;
+      }
+      const code = st.active_party?.room_code || st.active_party_room_code;
+      if (typeof code === "string" && code.trim()) {
+        this.#roomCode = sanitizeSingleLine(code);
+      }
+    }
+
+    if (listRes.status !== "fulfilled" || !listRes.value || typeof listRes.value !== "object") {
+      const msg =
+        listRes.status === "rejected"
+          ? redactUrlFragments(sanitizeSingleLine((listRes.reason as Error)?.message ?? String(listRes.reason)))
+          : "Unable to query mp-outpost party list";
+      this.#state = "error";
+      this.#lastError = msg;
+      this.#notify();
+      return false;
+    }
+
+    const listed = listRes.value as {
+      daemon_epoch?: number;
+      parties?: Array<{
+        party_id?: number;
+        next_seq?: number;
+        member_count?: number;
+        room_code?: string;
+      }>;
+    };
+    const parties = Array.isArray(listed.parties) ? listed.parties : [];
+    const target =
+      this.#explicitPartyId !== undefined
+        ? parties.find((p) => p?.party_id === this.#explicitPartyId) ?? { party_id: this.#explicitPartyId }
+        : parties[0];
+
+    if (!target?.party_id || !Number.isSafeInteger(target.party_id)) {
+      this.#partyId = null;
+      this.#memberCount = null;
+      this.#daemonEpoch = null;
+      this.#state = "idle";
+      this.#lastError = "No active multiplayer.tech party";
+      this.#notify();
+      return false;
+    }
+
+    const switchedParty = this.#partyId !== null && this.#partyId !== target.party_id;
+    this.#partyId = target.party_id;
+    this.#memberCount =
+      typeof target.member_count === "number" && Number.isFinite(target.member_count) ? target.member_count : null;
+    if (typeof target.room_code === "string" && target.room_code.trim()) {
+      this.#roomCode = sanitizeSingleLine(target.room_code);
+    }
+    if (typeof listed.daemon_epoch === "number" && Number.isSafeInteger(listed.daemon_epoch)) {
+      if (this.#daemonEpoch !== null && this.#daemonEpoch !== listed.daemon_epoch) {
+        this.#seenSeqs.clear();
+      }
+      this.#daemonEpoch = listed.daemon_epoch;
+    }
+    if (switchedParty) {
+      this.#messages = [];
+      this.#seenSeqs.clear();
+      this.#unreadCount = 0;
+    }
+
+    const listedNextSeq =
+      typeof target.next_seq === "number" && Number.isSafeInteger(target.next_seq) && target.next_seq >= 0
+        ? target.next_seq
+        : 0;
+    const seedAfterSeq = Math.max(0, listedNextSeq - this.#seedCount);
+
+    try {
+      const readResp = (await runOutpostJson(
+        [
+          "party",
+          "read",
+          String(this.#partyId),
+          "--after-seq",
+          String(seedAfterSeq),
+          "--limit",
+          String(this.#seedCount),
+        ],
+        { timeoutMs: 8_000, signal },
+      )) as {
+        daemon_epoch?: number;
+        next_seq?: number;
+        events?: OutpostPartyEvent[];
+      };
+      if (!this.#running || signal.aborted) return false;
+      if (typeof readResp.daemon_epoch === "number" && Number.isSafeInteger(readResp.daemon_epoch)) {
+        this.#daemonEpoch = readResp.daemon_epoch;
+      }
+      if (Array.isArray(readResp.events)) {
+        this.#ingestEvents(readResp.events, false);
+      }
+      const readNext =
+        typeof readResp.next_seq === "number" && Number.isSafeInteger(readResp.next_seq) ? readResp.next_seq : 0;
+      this.#nextSeq = Math.max(this.#nextSeq, listedNextSeq, readNext);
+    } catch {
+      // Seed read is best-effort; still advance to listed next_seq and start live wait.
+      if (!this.#running || signal.aborted) return false;
+      this.#nextSeq = Math.max(this.#nextSeq, listedNextSeq);
+    }
+
+    this.#state = "live";
+    this.#lastError = null;
+    this.#notify();
+    return true;
+  }
+
+  async #runLoop(signal: AbortSignal): Promise<void> {
+    while (this.#running && !signal.aborted) {
+      if (this.#partyId === null) {
+        await sleepAbortable(this.#backoffMs, signal);
+        if (!this.#running || signal.aborted) break;
+        await this.#resolveAndSeed(signal);
+        continue;
+      }
+
+      const waitArgs = [
+        "party",
+        "wait",
+        String(this.#partyId),
+        "--after-seq",
+        String(this.#nextSeq),
+        "--timeout-ms",
+        String(this.#waitTimeoutMs),
+      ];
+      if (this.#daemonEpoch !== null && this.#daemonEpoch > 0) {
+        waitArgs.push("--cursor-epoch", String(this.#daemonEpoch));
+      }
+
+      const startedAt = Date.now();
+      try {
+        const resp = (await runOutpostJson(waitArgs, {
+          timeoutMs: this.#waitTimeoutMs + 15_000,
+          signal,
+        })) as {
+          daemon_epoch?: number;
+          next_seq?: number;
+          cursor_reset?: boolean;
+          events?: OutpostPartyEvent[];
+        };
+        if (!this.#running || signal.aborted) break;
+
+        let changed = this.#state !== "live" || this.#lastError !== null;
+        this.#state = "live";
+        this.#lastError = null;
+
+        if (resp.cursor_reset) {
+          this.#seenSeqs.clear();
+        }
+        if (typeof resp.daemon_epoch === "number" && Number.isSafeInteger(resp.daemon_epoch)) {
+          if (this.#daemonEpoch !== null && this.#daemonEpoch !== resp.daemon_epoch) {
+            this.#seenSeqs.clear();
+          }
+          this.#daemonEpoch = resp.daemon_epoch;
+        }
+
+        const events = Array.isArray(resp.events) ? resp.events : [];
+        if (events.length > 0 && this.#ingestEvents(events, true)) {
+          changed = true;
+        }
+        if (typeof resp.next_seq === "number" && Number.isSafeInteger(resp.next_seq)) {
+          if (resp.cursor_reset) {
+            this.#nextSeq = resp.next_seq;
+          } else if (resp.next_seq > this.#nextSeq) {
+            this.#nextSeq = resp.next_seq;
+          }
+        }
+        if (changed) {
+          this.#notify();
+        }
+
+        // Prevent tight CPU spin when a mock or daemon returns empty responses instantaneously.
+        if (events.length === 0 && Date.now() - startedAt < 50) {
+          await sleepAbortable(Math.min(this.#backoffMs, 50), signal);
+        }
+      } catch (err) {
+        if (!this.#running || signal.aborted) break;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isInactivePartyError(msg)) {
+          this.#partyId = null;
+          this.#daemonEpoch = null;
+          this.#nextSeq = 0;
+          this.#seenSeqs.clear();
+          this.#state = "reconnecting";
+          this.#lastError = "Party ended or changed; reconnecting...";
+          this.#notify();
+          await sleepAbortable(this.#backoffMs, signal);
+          if (!this.#running || signal.aborted) break;
+          await this.#resolveAndSeed(signal);
+        } else {
+          this.#state = "reconnecting";
+          this.#lastError = redactUrlFragments(sanitizeSingleLine(msg));
+          this.#notify();
+          await sleepAbortable(this.#backoffMs, signal);
+        }
+      }
+    }
+  }
+}
+
+const FALLBACK_THEME: PiTheme = {
+  fg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+};
+
+function styleFg(theme: PiTheme | undefined, color: string, text: string): string {
+  if (typeof theme?.fg === "function") {
+    try {
+      return theme.fg(color, text);
+    } catch {
+      return text;
+    }
+  }
+  return text;
+}
+
+function styleBold(theme: PiTheme | undefined, text: string): string {
+  if (typeof theme?.bold === "function") {
+    try {
+      return theme.bold(text);
+    } catch {
+      return text;
+    }
+  }
+  return text;
+}
+
+function renderBorderTop(titleStyled: string, width: number, theme?: PiTheme): string {
+  if (width <= 0) return "";
+  if (width < 4) return truncateAnsi(titleStyled, width);
+  const inner = width - 2;
+  const maxTitle = Math.max(0, inner - 3);
+  const title = maxTitle > 0 ? truncateAnsi(titleStyled, maxTitle) : "";
+  const titleW = visibleWidth(title);
+  const lead = "─";
+  const trailLen = Math.max(0, inner - 1 - (titleW > 0 ? titleW + 2 : 0));
+  const mid = titleW > 0 ? ` ${title} ${"─".repeat(trailLen)}` : "─".repeat(Math.max(0, inner - 1));
+  const raw = `${styleFg(theme, "borderMuted", `╭${lead}`)}${mid}${styleFg(theme, "borderMuted", "╮")}`;
+  return truncateAnsi(raw, width);
+}
+
+function renderBorderBottom(footerStyled: string, width: number, theme?: PiTheme): string {
+  if (width <= 0) return "";
+  if (width < 4) return truncateAnsi(footerStyled, width);
+  const inner = width - 2;
+  const maxFoot = Math.max(0, inner - 3);
+  const foot = maxFoot > 0 ? truncateAnsi(footerStyled, maxFoot) : "";
+  const footW = visibleWidth(foot);
+  const lead = "─";
+  const trailLen = Math.max(0, inner - 1 - (footW > 0 ? footW + 2 : 0));
+  const mid = footW > 0 ? ` ${foot} ${"─".repeat(trailLen)}` : "─".repeat(Math.max(0, inner - 1));
+  const raw = `${styleFg(theme, "borderMuted", `╰${lead}`)}${mid}${styleFg(theme, "borderMuted", "╯")}`;
+  return truncateAnsi(raw, width);
+}
+
+function renderBoxDivider(width: number, theme?: PiTheme): string {
+  if (width <= 0) return "";
+  if (width < 2) return "─".repeat(width);
+  return styleFg(theme, "borderMuted", `├${"─".repeat(width - 2)}┤`);
+}
+
+function renderBoxRow(contentStyled: string, width: number, theme?: PiTheme): string {
+  if (width <= 0) return "";
+  if (width < 4) return truncateAnsi(contentStyled, width);
+  const inner = width - 4;
+  const padded = padAnsi(contentStyled, inner);
+  const bar = styleFg(theme, "borderMuted", "│");
+  return `${bar} ${padded} ${bar}`;
+}
+
+export function formatPartyStatusBadge(snapshot: PartyFeedSnapshot): string | undefined {
+  if (!snapshot.running && snapshot.partyId === null) return undefined;
+  const idPart = snapshot.partyId !== null ? `party #${snapshot.partyId}` : "party";
+  const codePart = snapshot.roomCode ? ` (${snapshot.roomCode})` : "";
+  const unreadPart = snapshot.unreadCount > 0 ? ` · ${snapshot.unreadCount} new` : "";
+  const statePart =
+    snapshot.state === "live"
+      ? snapshot.memberCount !== null
+        ? `${snapshot.memberCount} live`
+        : "live"
+      : snapshot.state;
+  return `${idPart}${codePart} · ${statePart}${unreadPart}`;
+}
+
+function formatMessageHeaderStyled(msg: PartyFeedMessage, theme?: PiTheme): string {
+  const handleColor = msg.isOwnSent ? "success" : "accent";
+  const handlePart = styleFg(theme, handleColor, styleBold(theme, msg.handle));
+  const browserPart = msg.isBrowser ? ` ${styleFg(theme, "warning", "[browser]")}` : "";
+  return `${handlePart}${browserPart}:`;
+}
+
+export function renderDockedPartyWidgetLines(
+  snapshot: PartyFeedSnapshot,
+  width: number,
+  theme: PiTheme = FALLBACK_THEME,
+): string[] {
+  const safeWidth = Math.max(1, Math.trunc(width));
+  const partyLabel = snapshot.partyId !== null ? `Party #${snapshot.partyId}` : "No Party";
+  const stateLabel =
+    snapshot.state === "live"
+      ? snapshot.memberCount !== null
+        ? `${snapshot.memberCount} live`
+        : `${snapshot.messages.length} live`
+      : snapshot.state;
+  const headerText =
+    `${styleFg(theme, "accent", styleBold(theme, "Multiplayer"))} · ${styleFg(theme, "text", partyLabel)} · ` +
+    `${styleFg(theme, snapshot.state === "live" ? "success" : "warning", stateLabel)} · ` +
+    `${styleFg(theme, "warning", "UNTRUSTED EXTERNAL DATA")}`;
+
+  const lines: string[] = [renderBorderTop(headerText, safeWidth, theme)];
+  const recent = snapshot.messages.slice(-DOCKED_WIDGET_MAX_MESSAGES);
+
+  if (recent.length === 0) {
+    const emptyMsg =
+      snapshot.lastError ??
+      (snapshot.state === "connecting"
+        ? "Connecting to party feed..."
+        : snapshot.partyId !== null
+          ? "No recent messages yet. Waiting live..."
+          : "No active party. Run /party-invite or /party-join.");
+    lines.push(renderBoxRow(styleFg(theme, "muted", emptyMsg), safeWidth, theme));
+  } else {
+    for (const msg of recent) {
+      const singleLineBody = msg.body.replace(/\s+/g, " ").trim();
+      const bodyColor = msg.card ? "mdHeading" : "text";
+      const row = `${formatMessageHeaderStyled(msg, theme)} ${styleFg(theme, bodyColor, singleLineBody)}`;
+      lines.push(renderBoxRow(row, safeWidth, theme));
+    }
+  }
+
+  const footerText = styleFg(theme, "dim", "/party-overlay to chat · /party-panel off to hide");
+  lines.push(renderBorderBottom(footerText, safeWidth, theme));
+  return lines;
+}
+
+export function createDockedPartyWidgetComponent(
+  watcher: PartyFeedWatcher,
+  tui: PiTUI | undefined,
+  theme: PiTheme = FALLBACK_THEME,
+): PiComponent {
+  const unsubscribe = watcher.subscribe(() => {
+    tui?.requestRender?.();
+  });
+  return {
+    render(width: number): string[] {
+      return renderDockedPartyWidgetLines(watcher.getSnapshot(), width, theme);
+    },
+    invalidate(): void {
+      // Dynamic live snapshot; nothing cached.
+    },
+    dispose(): void {
+      unsubscribe();
+    },
+  };
+}
+
+function decodeKittyPrintable(data: string): string | null {
+  const match = /^\x1b\[(\d+)(?:;(\d+))?u$/.exec(data);
+  if (!match) return null;
+  const codepoint = Number(match[1]);
+  const mod = match[2] ? Number(match[2]) - 1 : 0;
+  // Ignore Ctrl (4), Alt (2), Super (8) modified sequences.
+  if ((mod & (2 | 4 | 8)) !== 0) return null;
+  if (codepoint < 0x20 || codepoint === 0x7f || codepoint > 0x10ffff) return null;
+  return String.fromCodePoint(codepoint);
+}
+
+function parseOverlayMouseWheel(data: string): -1 | 1 | null {
+  if (!data.startsWith("\x1b[<")) return null;
+  const match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
+  if (!match) return null;
+  const button = Number(match[1]);
+  if ((button & 64) !== 0 && (button & 2) === 0) {
+    return (button & 1) !== 0 ? 1 : -1;
+  }
+  return null;
+}
+
+export interface PartyChatOverlayOptions {
+  watcher: PartyFeedWatcher;
+  tui?: PiTUI;
+  theme?: PiTheme;
+  done: () => void;
+  onSend: (body: string) => Promise<{ ok: boolean; error?: string; seq?: number }>;
+}
+
+export function createPartyChatOverlayComponent(options: PartyChatOverlayOptions): PiComponent {
+  const { watcher, tui, done, onSend } = options;
+  const theme = options.theme ?? FALLBACK_THEME;
+
+  let input = "";
+  let cursor = 0;
+  let scrollOffset = 0;
+  let lastViewportHeight = 10;
+  let lastMaxScroll = 0;
+  let sending = false;
+  let closed = false;
+  let banner: { level: "info" | "warning" | "error"; text: string } | null = null;
+
+  watcher.markRead();
+
+  const requestRender = (): void => {
+    if (!closed) tui?.requestRender?.();
+  };
+
+  const unsubscribe = watcher.subscribe(() => {
+    if (scrollOffset === 0) {
+      watcher.markRead();
+    }
+    requestRender();
+  });
+
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    unsubscribe();
+    done();
+  };
+
+  const insertText = (raw: string): void => {
+    const clean = stripAnsi(raw)
+      .replace(/[\r\n\t]+/g, " ")
+      .replace(/[\x00-\x1f\x7f]/g, "");
+    if (!clean) return;
+    input = `${input.slice(0, cursor)}${clean}${input.slice(cursor)}`;
+    cursor += clean.length;
+    if (banner?.level === "error" || banner?.level === "warning") {
+      banner = null;
+    }
+  };
+
+  const submitMessage = (): void => {
+    if (sending) return;
+    const trimmed = input.trim();
+    if (!trimmed) return;
+
+    if (AMBIGUOUS_SAY_FLAGS.has(trimmed)) {
+      banner = { level: "error", text: "Refused ambiguous flag-only message body." };
+      requestRender();
+      return;
+    }
+    const secretKind = detectForbiddenSecret(trimmed);
+    if (secretKind !== null) {
+      banner = {
+        level: "error",
+        text: `Refused outbound message: detected forbidden secret material (${secretKind}).`,
+      };
+      requestRender();
+      return;
+    }
+
+    sending = true;
+    banner = { level: "info", text: "Sending..." };
+    requestRender();
+
+    void onSend(trimmed)
+      .then((res) => {
+        sending = false;
+        if (closed) return;
+        if (res.ok) {
+          input = "";
+          cursor = 0;
+          scrollOffset = 0;
+          watcher.recordLocalSent(trimmed, res.seq);
+          banner = { level: "info", text: "Sent." };
+        } else {
+          banner = {
+            level: "error",
+            text: redactUrlFragments(sanitizeSingleLine(res.error || "Send failed.")),
+          };
+        }
+        requestRender();
+      })
+      .catch((err: unknown) => {
+        sending = false;
+        if (closed) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        banner = {
+          level: "error",
+          text: `Send failed: ${redactUrlFragments(sanitizeSingleLine(msg))}`,
+        };
+        requestRender();
+      });
+  };
+
+  const scrollBy = (deltaLines: number): void => {
+    scrollOffset = Math.max(0, Math.min(lastMaxScroll, scrollOffset + deltaLines));
+    if (scrollOffset === 0) {
+      watcher.markRead();
+    }
+    requestRender();
+  };
+
+  const buildHistoryLines = (snapshot: PartyFeedSnapshot, innerWidth: number): string[] => {
+    const out: string[] = [];
+    if (snapshot.messages.length === 0) {
+      const msg =
+        snapshot.lastError ??
+        (snapshot.state === "connecting"
+          ? "Connecting to live party feed..."
+          : snapshot.partyId !== null
+            ? "No messages yet. Type below and press Enter to send."
+            : "No active party. Run /party-invite or /party-join first.");
+      for (const line of wrapPlainText(msg, innerWidth)) {
+        out.push(styleFg(theme, "muted", line));
+      }
+      return out;
+    }
+
+    for (const msg of snapshot.messages) {
+      const plainPrefix = `${msg.handle}${msg.isBrowser ? " [browser]" : ""}: `;
+      const styledPrefix = `${formatMessageHeaderStyled(msg, theme)} `;
+      const prefixW = visibleWidth(plainPrefix);
+      const firstLineBudget = Math.max(8, innerWidth - prefixW);
+      const contIndent = "  ";
+      const contBudget = Math.max(8, innerWidth - contIndent.length);
+
+      const paragraphs = msg.body.split("\n");
+      let isFirstLine = true;
+      for (const para of paragraphs) {
+        if (isFirstLine) {
+          const wrappedFirst = wrapPlainText(para, firstLineBudget);
+          const firstChunk = wrappedFirst[0] ?? "";
+          const bodyColor = msg.card ? "mdHeading" : "text";
+          out.push(`${styledPrefix}${styleFg(theme, bodyColor, firstChunk)}`);
+          isFirstLine = false;
+          if (wrappedFirst.length > 1) {
+            const remainder = wrappedFirst.slice(1).join(" ");
+            for (const cont of wrapPlainText(remainder, contBudget)) {
+              out.push(`${contIndent}${styleFg(theme, bodyColor, cont)}`);
+            }
+          }
+        } else {
+          const bodyColor = msg.card ? "mdHeading" : "text";
+          for (const cont of wrapPlainText(para, contBudget)) {
+            out.push(`${contIndent}${styleFg(theme, bodyColor, cont)}`);
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  const renderComposerContent = (innerWidth: number): string => {
+    const prompt = styleFg(theme, "accent", styleBold(theme, "> "));
+    const avail = Math.max(1, innerWidth - 2);
+
+    if (!input && !sending) {
+      const cursorGlyph = "\x1b[7m \x1b[27m";
+      const placeholder = styleFg(theme, "dim", "Type a message and press Enter...");
+      return truncateAnsi(`${prompt}${cursorGlyph}${placeholder}`, innerWidth);
+    }
+
+    // Window the composer horizontally around the cursor so it always fits `avail` columns.
+    const before = input.slice(0, cursor);
+    const atChar = cursor < input.length ? input[cursor] : " ";
+    const after = cursor < input.length ? input.slice(cursor + 1) : "";
+
+    let visBefore = before;
+    const beforeBudget = Math.max(0, avail - Math.max(1, visibleWidth(atChar)));
+    while (visibleWidth(visBefore) > beforeBudget && visBefore.length > 0) {
+      visBefore = visBefore.slice(1);
+    }
+    const used = visibleWidth(visBefore) + Math.max(1, visibleWidth(atChar));
+    const afterBudget = Math.max(0, avail - used);
+    const visAfter = truncateAnsi(after, afterBudget);
+    const cursorSpan = `\x1b[7m${atChar}\x1b[27m`;
+    return truncateAnsi(`${prompt}${visBefore}${cursorSpan}${visAfter}`, innerWidth);
+  };
+
+  return {
+    render(width: number): string[] {
+      const safeWidth = Math.max(1, Math.trunc(width));
+      const innerWidth = Math.max(1, safeWidth - 4);
+      const snapshot = watcher.getSnapshot();
+
+      const termRows =
+        typeof tui?.terminal?.rows === "number" && tui.terminal.rows > 0 ? Math.trunc(tui.terminal.rows) : 24;
+      const targetHeight = Math.max(10, Math.min(28, Math.floor(termRows * 0.8)));
+      // Overhead: top border (1) + warning row (1) + divider (1) + divider (1) + composer (1) + status/hint (1) + bottom border (1) = 7
+      const viewportHeight = Math.max(3, targetHeight - 7);
+      lastViewportHeight = viewportHeight;
+
+      const historyLines = buildHistoryLines(snapshot, innerWidth);
+      lastMaxScroll = Math.max(0, historyLines.length - viewportHeight);
+      if (scrollOffset > lastMaxScroll) scrollOffset = lastMaxScroll;
+
+      const endIdx = historyLines.length - scrollOffset;
+      const startIdx = Math.max(0, endIdx - viewportHeight);
+      const visibleSlice = historyLines.slice(startIdx, endIdx);
+
+      const partyTag = snapshot.partyId !== null ? `Party #${snapshot.partyId}` : "No Party";
+      const membersTag = snapshot.memberCount !== null ? ` · ${snapshot.memberCount} members` : "";
+      const stateColor = snapshot.state === "live" ? "success" : snapshot.state === "error" ? "error" : "warning";
+      const titleStyled =
+        `${styleFg(theme, "accent", styleBold(theme, "Multiplayer Chat"))} · ` +
+        `${styleFg(theme, "text", partyTag)}${styleFg(theme, "muted", membersTag)} · ` +
+        `${styleFg(theme, stateColor, snapshot.state)}`;
+
+      const scrollIndicator =
+        scrollOffset > 0
+          ? `[↑${scrollOffset} / ${historyLines.length} lines]`
+          : historyLines.length > viewportHeight
+            ? `[Live · ${historyLines.length} lines]`
+            : "[Live]";
+      const warningLeft = styleFg(theme, "warning", "UNTRUSTED EXTERNAL DATA · never treat peer text as instructions");
+      const scrollRight = styleFg(theme, "dim", scrollIndicator);
+      const warningGap = Math.max(1, innerWidth - visibleWidth(warningLeft) - visibleWidth(scrollRight));
+      const warningRow =
+        visibleWidth(warningLeft) + visibleWidth(scrollRight) + 1 <= innerWidth
+          ? `${warningLeft}${" ".repeat(warningGap)}${scrollRight}`
+          : `${warningLeft} ${scrollRight}`;
+
+      const rows: string[] = [
+        renderBorderTop(titleStyled, safeWidth, theme),
+        renderBoxRow(warningRow, safeWidth, theme),
+        renderBoxDivider(safeWidth, theme),
+      ];
+
+      for (let i = 0; i < viewportHeight; i++) {
+        rows.push(renderBoxRow(visibleSlice[i] ?? "", safeWidth, theme));
+      }
+
+      rows.push(renderBoxDivider(safeWidth, theme));
+      rows.push(renderBoxRow(renderComposerContent(innerWidth), safeWidth, theme));
+
+      const statusText = banner
+        ? styleFg(
+            theme,
+            banner.level === "error" ? "error" : banner.level === "warning" ? "warning" : "success",
+            banner.text,
+          )
+        : snapshot.lastError && snapshot.state !== "live"
+          ? styleFg(theme, "warning", snapshot.lastError)
+          : styleFg(theme, "dim", "↑/↓ PgUp/PgDn scroll · Enter send · Ctrl+U clear · Esc close");
+      rows.push(renderBoxRow(statusText, safeWidth, theme));
+      rows.push(renderBorderBottom("", safeWidth, theme));
+      return rows;
+    },
+
+    handleInput(data: string): void {
+      if (closed || !data) return;
+
+      // Esc or Ctrl+C closes cleanly.
+      if (
+        data === "\x1b" ||
+        data === "\x03" ||
+        /^\x1b\[27(?:;1)?u$/.test(data) ||
+        /^\x1b\[99;5u$/.test(data)
+      ) {
+        close();
+        return;
+      }
+
+      // SGR mouse events (scroll wheel supported; other mouse noise ignored).
+      if (data.startsWith("\x1b[<")) {
+        const wheel = parseOverlayMouseWheel(data);
+        if (wheel !== null) {
+          scrollBy(wheel < 0 ? 3 : -3);
+        }
+        return;
+      }
+
+      // Bracketed paste: unwrap and insert single-line sanitized text.
+      if (data.startsWith("\x1b[200~")) {
+        const pasted = data.replace(/^\x1b\[200~/, "").replace(/\x1b\[201~$/, "");
+        insertText(pasted);
+        requestRender();
+        return;
+      }
+
+      // Enter sends the composer message.
+      if (data === "\r" || data === "\n" || /^\x1b\[13(?:;1)?u$/.test(data)) {
+        submitMessage();
+        return;
+      }
+
+      // Scrolling: Up / Down / PageUp / PageDown.
+      if (data === "\x1b[A" || data === "\x1bOA" || /^\x1b\[1;1A$/.test(data)) {
+        scrollBy(1);
+        return;
+      }
+      if (data === "\x1b[B" || data === "\x1bOB" || /^\x1b\[1;1B$/.test(data)) {
+        scrollBy(-1);
+        return;
+      }
+      if (data === "\x1b[5~") {
+        scrollBy(Math.max(1, lastViewportHeight - 1));
+        return;
+      }
+      if (data === "\x1b[6~") {
+        scrollBy(-Math.max(1, lastViewportHeight - 1));
+        return;
+      }
+
+      // Composer cursor navigation & editing.
+      if (data === "\x1b[D" || data === "\x1bOD") {
+        if (cursor > 0) cursor -= 1;
+        requestRender();
+        return;
+      }
+      if (data === "\x1b[C" || data === "\x1bOC") {
+        if (cursor < input.length) cursor += 1;
+        requestRender();
+        return;
+      }
+      if (data === "\x01" || data === "\x1b[H" || data === "\x1bOH" || data === "\x1b[1~") {
+        cursor = 0;
+        requestRender();
+        return;
+      }
+      if (data === "\x05" || data === "\x1b[F" || data === "\x1bOF" || data === "\x1b[4~") {
+        cursor = input.length;
+        requestRender();
+        return;
+      }
+      if (data === "\x7f" || data === "\x08" || /^\x1b\[127(?:;1)?u$/.test(data)) {
+        if (cursor > 0) {
+          input = `${input.slice(0, cursor - 1)}${input.slice(cursor)}`;
+          cursor -= 1;
+          if (banner?.level === "error") banner = null;
+          requestRender();
+        }
+        return;
+      }
+      if (data === "\x1b[3~") {
+        if (cursor < input.length) {
+          input = `${input.slice(0, cursor)}${input.slice(cursor + 1)}`;
+          if (banner?.level === "error") banner = null;
+          requestRender();
+        }
+        return;
+      }
+      if (data === "\x15" || /^\x1b\[117;5u$/.test(data)) {
+        // Ctrl+U: clear before cursor (or entire line if cursor is at start).
+        if (cursor > 0) {
+          input = input.slice(cursor);
+          cursor = 0;
+        } else {
+          input = "";
+        }
+        banner = null;
+        requestRender();
+        return;
+      }
+      if (data === "\x0b") {
+        // Ctrl+K: kill to end of line.
+        input = input.slice(0, cursor);
+        requestRender();
+        return;
+      }
+      if (data === "\x17") {
+        // Ctrl+W: delete previous word.
+        const before = input.slice(0, cursor).replace(/\S*\s*$/, "");
+        input = `${before}${input.slice(cursor)}`;
+        cursor = before.length;
+        requestRender();
+        return;
+      }
+
+      // Kitty printable CSI-u sequence.
+      if (data.startsWith("\x1b[") && data.endsWith("u")) {
+        const ch = decodeKittyPrintable(data);
+        if (ch) {
+          insertText(ch);
+          requestRender();
+        }
+        return;
+      }
+
+      // Ignore any other unrecognized escape sequences.
+      if (data.startsWith("\x1b")) {
+        return;
+      }
+
+      insertText(data);
+      requestRender();
+    },
+
+    invalidate(): void {
+      // Dynamic snapshot; nothing cached.
+    },
+
+    dispose(): void {
+      if (!closed) {
+        closed = true;
+        unsubscribe();
+      }
+    },
+  };
+}
+
 export default function multiplayerExtension(pi: PiExtensionAPI): void {
   if (typeof pi.registerTool === "function") {
     for (const tool of buildPiTools()) {
       pi.registerTool(tool);
     }
   }
+
+  const feedWatcher = new PartyFeedWatcher();
+  let panelEnabled = false;
+  let panelPlacement: PiWidgetPlacement = "aboveEditor";
+  let overlayOpen = false;
+  let fallbackStringWidget = false;
+  let activeUiCtx: PiCommandContext | undefined;
+
+  const pushFallbackWidgetLines = (snap: PartyFeedSnapshot): void => {
+    if (!panelEnabled || !fallbackStringWidget || typeof activeUiCtx?.ui?.setWidget !== "function") return;
+    try {
+      activeUiCtx.ui.setWidget(
+        DOCKED_WIDGET_KEY,
+        renderDockedPartyWidgetLines(snap, 80, activeUiCtx.ui.theme ?? FALLBACK_THEME),
+        { placement: panelPlacement },
+      );
+    } catch {
+      // Ignore transient UI errors during teardown.
+    }
+  };
+
+  feedWatcher.subscribe((snap) => {
+    if (panelEnabled || overlayOpen) {
+      activeUiCtx?.ui?.setStatus?.("multiplayer", formatPartyStatusBadge(snap));
+    }
+    pushFallbackWidgetLines(snap);
+  });
+
+  const mountDockedWidget = (ctx: PiCommandContext): boolean => {
+    if (typeof ctx?.ui?.setWidget !== "function") {
+      notifyUser(
+        ctx,
+        "Docked party panel requires Pi interactive TUI (ctx.ui.setWidget unavailable). Use /party or /party-chat instead.",
+        "warning",
+      );
+      return false;
+    }
+    activeUiCtx = ctx;
+    fallbackStringWidget = false;
+    try {
+      ctx.ui.setWidget(
+        DOCKED_WIDGET_KEY,
+        (tui, theme) => createDockedPartyWidgetComponent(feedWatcher, tui, theme),
+        { placement: panelPlacement },
+      );
+    } catch {
+      // Fallback for minimal host/mock implementations that only accept string[].
+      fallbackStringWidget = true;
+      ctx.ui.setWidget(
+        DOCKED_WIDGET_KEY,
+        renderDockedPartyWidgetLines(feedWatcher.getSnapshot(), 80, ctx.ui.theme ?? FALLBACK_THEME),
+        { placement: panelPlacement },
+      );
+    }
+    return true;
+  };
+
+  const unmountDockedWidget = (ctx?: PiCommandContext): void => {
+    const targetCtx = ctx ?? activeUiCtx;
+    panelEnabled = false;
+    fallbackStringWidget = false;
+    targetCtx?.ui?.setWidget?.(DOCKED_WIDGET_KEY, undefined);
+    if (!overlayOpen) {
+      feedWatcher.stop();
+      const snap = feedWatcher.getSnapshot();
+      targetCtx?.ui?.setStatus?.(
+        "multiplayer",
+        snap.partyId !== null ? `party #${snap.partyId}${snap.roomCode ? ` (${snap.roomCode})` : ""}` : undefined,
+      );
+    }
+  };
+
+  const openOverlayPanel = async (ctx: PiCommandContext): Promise<void> => {
+    if (typeof ctx?.ui?.custom !== "function") {
+      notifyUser(
+        ctx,
+        "Interactive party overlay requires Pi interactive TUI (ctx.ui.custom unavailable). Use /party, /party-say, or /party-chat instead.",
+        "warning",
+      );
+      return;
+    }
+    activeUiCtx = ctx;
+    overlayOpen = true;
+    void feedWatcher.start();
+    try {
+      await ctx.ui.custom<void>(
+        (tui, theme, _keybindings, done) =>
+          createPartyChatOverlayComponent({
+            watcher: feedWatcher,
+            tui,
+            theme,
+            done: () => done(undefined),
+            onSend: async (body: string) => {
+              const snap = feedWatcher.getSnapshot();
+              let partyId = snap.partyId;
+              if (partyId === null) {
+                try {
+                  partyId = await resolveActivePartyId(undefined);
+                } catch (err) {
+                  return { ok: false, error: (err as Error).message };
+                }
+              }
+              try {
+                const resp = (await runOutpostJson(["party", "say", String(partyId), "--scope", "party/main", body])) as {
+                  event_seq?: number;
+                  seq?: number;
+                };
+                const seq =
+                  typeof resp?.event_seq === "number"
+                    ? resp.event_seq
+                    : typeof resp?.seq === "number"
+                      ? resp.seq
+                      : undefined;
+                return { ok: true, seq };
+              } catch (err) {
+                return { ok: false, error: (err as Error).message };
+              }
+            },
+          }),
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "center",
+            width: "85%",
+            minWidth: 50,
+            maxHeight: "85%",
+            margin: 1,
+          },
+        },
+      );
+    } catch (err) {
+      notifyUser(ctx, `party-overlay failed: ${redactUrlFragments((err as Error).message)}`, "error");
+    } finally {
+      overlayOpen = false;
+      if (!panelEnabled) {
+        feedWatcher.stop();
+      }
+    }
+  };
 
   const openChatWindow = async (ctx: PiCommandContext, target?: string): Promise<void> => {
     try {
@@ -1546,11 +3083,72 @@ export default function multiplayerExtension(pi: PiExtensionAPI): void {
     },
   });
 
-  pi.registerCommand("party-chat", {
-    description: "Open mp-outpost party chat in a detached phux window: /party-chat [target]",
-    async handler(rawArgs, ctx) {
-      await openChatWindow(ctx, rawArgs.trim() || undefined);
+  pi.registerShortcut?.("ctrl+shift+m", {
+    description: "Open interactive native multiplayer.tech party chat overlay",
+    async handler(ctx) {
+      await openOverlayPanel(ctx);
     },
+  });
+
+  pi.registerCommand("party-panel", {
+    description: "Toggle live docked multiplayer.tech party chat widget: /party-panel [on|off|above|below]",
+    async handler(rawArgs, ctx) {
+      const arg = rawArgs.trim().toLowerCase();
+      if (arg && !["on", "off", "above", "below"].includes(arg)) {
+        notifyUser(ctx, "Usage: /party-panel [on|off|above|below]", "warning");
+        return;
+      }
+
+      if (arg === "off" || (!arg && panelEnabled)) {
+        unmountDockedWidget(ctx);
+        notifyUser(ctx, "Multiplayer party panel hidden.", "info");
+        return;
+      }
+
+      if (arg === "above") panelPlacement = "aboveEditor";
+      else if (arg === "below") panelPlacement = "belowEditor";
+
+      if (!mountDockedWidget(ctx)) return;
+      panelEnabled = true;
+      const snap = await feedWatcher.start();
+      if (panelEnabled) {
+        ctx.ui?.setStatus?.("multiplayer", formatPartyStatusBadge(snap));
+        pushFallbackWidgetLines(snap);
+        notifyUser(
+          ctx,
+          `Multiplayer party panel enabled (${panelPlacement === "belowEditor" ? "below editor" : "above editor"}).`,
+          "info",
+        );
+      }
+    },
+  });
+
+  pi.registerCommand("party-overlay", {
+    description: "Open interactive native multiplayer.tech party chat overlay (scroll + send live)",
+    async handler(_rawArgs, ctx) {
+      await openOverlayPanel(ctx);
+    },
+  });
+
+  pi.registerCommand("party-chat", {
+    description: "Open mp-outpost party chat in detached phux (or native overlay with --inline): /party-chat [--inline|target]",
+    async handler(rawArgs, ctx) {
+      const trimmed = rawArgs.trim();
+      if (trimmed === "--inline" || trimmed.startsWith("--inline ")) {
+        await openOverlayPanel(ctx);
+        return;
+      }
+      await openChatWindow(ctx, trimmed || undefined);
+    },
+  });
+
+  pi.on?.("session_shutdown", async (_event?: unknown, ctx?: PiCommandContext) => {
+    overlayOpen = false;
+    if (panelEnabled) {
+      unmountDockedWidget(ctx);
+    } else {
+      feedWatcher.stop();
+    }
   });
 
   pi.on?.("session_start", async (arg1: unknown, arg2?: PiCommandContext) => {

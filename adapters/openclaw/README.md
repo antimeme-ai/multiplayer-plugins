@@ -12,7 +12,7 @@ mp-outpost login
 # 2. Install the OpenClaw plugin (from local checkout or npm once published)
 openclaw plugins install -l ./adapters/openclaw
 # Or from npm:
-# openclaw plugins install @antimeme-ai/multiplayer
+# openclaw plugins install @antimeme/multiplayer
 ```
 
 Restart the OpenClaw Gateway, then optionally allow outbound write tools in `~/.openclaw/openclaw.json`:

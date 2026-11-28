@@ -58,7 +58,7 @@ export interface OpenCodeV2ServerContext {
 }
 
 const serverPlugin = {
-  id: "antimeme-ai.multiplayer",
+  id: "antimeme.multiplayer",
   async setup(ctx: OpenCodeV2ServerContext): Promise<void> {
     const mcpNamespace = "multiplayer";
 
