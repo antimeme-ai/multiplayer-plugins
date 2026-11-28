@@ -813,7 +813,7 @@ class TestMultiHostPlugins(unittest.TestCase):
             rc = hermes._cli_entrypoint(SimpleNamespace(action="setup", write=False, binary="mp-outpost"))
         self.assertIs(type(rc), int)
         self.assertEqual(rc, 0)
-        self.assertIn("hermes mcp add multiplayer -- mp-outpost mcp", buf.getvalue())
+        self.assertIn("hermes mcp add multiplayer --command mp-outpost --connect-timeout 30 --args mcp", buf.getvalue())
 
         # 3. register(ctx) makes pre_llm_call opt-in by default and shares cursor across /party-read
         registered_hooks: dict[str, object] = {}

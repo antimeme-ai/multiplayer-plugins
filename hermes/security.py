@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import secrets
-from typing import Final
+from typing import Final, Mapping
 
 RECOVERY_KEY_DOMAIN_SEP: Final[bytes] = b"mp-recovery-v1:"
 MAX_RECOVERY_WINDOW_TOKENS: Final[int] = 16
@@ -297,6 +298,54 @@ def detect_secret_kind(payload: str | bytes) -> str | None:
     if _contains_recovery_key(norm):
         return "recovery_key"
     return None
+
+
+_SAFE_SUBPROCESS_ENV_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "LANG",
+        "TZ",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+        "OUTPOST_STATE_DIR",
+        "OUTPOST_RUNTIME_DIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+)
+
+
+def build_outpost_subprocess_env(
+    state_dir: str | None = None,
+    *,
+    source_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a minimal allowlisted environment for ``mp-outpost`` child processes.
+
+    Prevents LLM provider API keys and other host secrets in Hermes's process
+    environment from leaking into ``mp-outpost`` subprocesses.
+    """
+    src = os.environ if source_env is None else source_env
+    env: dict[str, str] = {}
+    for key, val in src.items():
+        if key in _SAFE_SUBPROCESS_ENV_KEYS or key.startswith("LC_"):
+            env[key] = val
+    if state_dir:
+        env["OUTPOST_STATE_DIR"] = state_dir
+    return env
 
 
 def refuse_secrets(payload: str | bytes) -> None:

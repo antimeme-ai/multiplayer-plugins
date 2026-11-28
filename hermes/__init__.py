@@ -1,26 +1,29 @@
-"""Nous Research Hermes Agent plugin for multiplayer.tech (`mp-outpost` v0.7.0).
+"""Nous Research Hermes Agent plugin for multiplayer.tech (`mp-outpost` v0.7.1).
 
 Implements all three integration tiers against Hermes v0.22+ runtime contracts:
-- Tier 1: MCP config snippet generator & atomic Hermes YAML config upserter
-  (``timeout: 90``, ``connect_timeout: 30`` for ``party_wait`` max 45 s), lazy-loading
-  YAML so Hermes's isolated capability probe passes with zero import-time deps.
+- Tier 1: MCP setup helper printing or invoking ``hermes mcp add multiplayer``
+  (respecting the active Hermes profile without rewriting ``config.yaml``),
+  lazy-loading YAML so Hermes's isolated capability probe passes with zero
+  import-time deps.
 - Tier 2: 1-verb ``hermes multiplayer`` CLI commands, in-session slash commands
-  (``/party-status``, ``/party-invite``, ``/party-join``, ``/party-leave``,
-  ``/party-friends``, ``/party-read``), secret redaction patterns, and a non-blocking
-  ``pre_llm_call`` unread-message hook returning Hermes ``{"context": "..."}`` payloads.
+  (``/party-status``, ``/party-chat``, ``/party-say``, ``/party-listen``,
+  ``/party-invite``, ``/party-join``, ``/party-leave``, ``/party-friends``,
+  ``/party-read``), secret redaction patterns, and an opt-in non-blocking
+  ``pre_llm_call`` unread-message hook returning Hermes ``{"context": "..."}``
+  payloads.
 - Tier 3: ``MultiplayerPlatformAdapter`` Gateway platform adapter registered via
   ``ctx.register_platform(...)`` with real Hermes ``BasePlatformAdapter`` lifecycle
-  (``connect``/``disconnect``/``send``).
+  (``connect``/``disconnect``/``send``/``handle_message``).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, Final
 
@@ -46,6 +49,7 @@ from .security import (
     REDACTION_PATTERNS,
     SecretRefusalError,
     break_angle_runs,
+    build_outpost_subprocess_env,
     detect_secret_kind,
     fence_peer_text,
     redact_url_fragments,
@@ -90,7 +94,42 @@ def _load_yaml_module() -> Any:
 
 
 def default_hermes_config_path() -> Path:
-    return Path.home() / ".hermes" / "config.yaml"
+    """Resolve the active Hermes profile's ``config.yaml`` via ``hermes_constants``."""
+    try:
+        import hermes_constants  # type: ignore[import-not-found]
+
+        return Path(hermes_constants.get_hermes_home()) / "config.yaml"
+    except Exception:
+        return Path.home() / ".hermes" / "config.yaml"
+
+
+def build_hermes_mcp_add_argv(
+    *,
+    binary: str = "mp-outpost",
+    state_dir: str | None = None,
+    connect_timeout: int = DEFAULT_HERMES_CONNECT_TIMEOUT_S,
+    hermes_binary: str = "hermes",
+) -> list[str]:
+    """Build the ``hermes mcp add`` CLI command to register ``mp-outpost mcp``."""
+    if not binary or not binary.strip():
+        raise ValueError("binary must be a non-empty command or path")
+    if connect_timeout < 5:
+        raise ValueError("connect_timeout must be >= 5s")
+    argv = [
+        hermes_binary,
+        "mcp",
+        "add",
+        "multiplayer",
+        "--command",
+        binary,
+        "--connect-timeout",
+        str(int(connect_timeout)),
+    ]
+    if state_dir:
+        argv.extend(["--env", f"OUTPOST_STATE_DIR={state_dir}"])
+    # `--args` must be the final option for `hermes mcp add`.
+    argv.extend(["--args", "mcp"])
+    return argv
 
 
 def build_hermes_mcp_entry(
@@ -100,7 +139,7 @@ def build_hermes_mcp_entry(
     timeout: int = DEFAULT_HERMES_MCP_TIMEOUT_S,
     connect_timeout: int = DEFAULT_HERMES_CONNECT_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Build the Hermes ``mcp_servers.multiplayer`` mapping."""
+    """Build the reference Hermes ``mcp_servers.multiplayer`` mapping."""
     if not binary or not binary.strip():
         raise ValueError("binary must be a non-empty command or path")
     if timeout < MIN_PARTY_WAIT_TOOL_TIMEOUT_S:
@@ -128,7 +167,7 @@ def render_hermes_mcp_snippet(
     timeout: int = DEFAULT_HERMES_MCP_TIMEOUT_S,
     connect_timeout: int = DEFAULT_HERMES_CONNECT_TIMEOUT_S,
 ) -> str:
-    """Render a copy-pasteable Hermes YAML configuration snippet."""
+    """Render a copy-pasteable reference Hermes YAML configuration snippet."""
     yaml_mod = _load_yaml_module()
     payload = {
         "mcp_servers": {
@@ -143,89 +182,8 @@ def render_hermes_mcp_snippet(
     return yaml_mod.safe_dump(payload, sort_keys=False)
 
 
-def upsert_hermes_mcp_config(
-    config_path: str | Path | None = None,
-    *,
-    binary: str = "mp-outpost",
-    state_dir: str | None = None,
-    timeout: int = DEFAULT_HERMES_MCP_TIMEOUT_S,
-    connect_timeout: int = DEFAULT_HERMES_CONNECT_TIMEOUT_S,
-) -> dict[str, Any]:
-    """Atomically upsert ``mcp_servers.multiplayer`` in Hermes YAML configuration.
-
-    Creates a mode-``0600`` ``.bak`` backup when updating an existing file and writes
-    through a same-directory temporary file + ``os.replace``. Never reads or modifies
-    Hermes secret stores or private keys.
-    """
-    yaml_mod = _load_yaml_module()
-    target = Path(config_path) if config_path is not None else default_hermes_config_path()
-    if target.is_symlink():
-        raise ValueError(f"refusing to overwrite symlinked Hermes config: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    existing: dict[str, Any] = {}
-    backup_path: Path | None = None
-    if target.exists():
-        raw_text = target.read_text(encoding="utf-8")
-        loaded = yaml_mod.safe_load(raw_text) if raw_text.strip() else {}
-        if loaded is None:
-            loaded = {}
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Hermes config at {target} must be a YAML mapping")
-        existing = loaded
-        backup_path = target.with_suffix(target.suffix + ".bak")
-        if backup_path.is_symlink():
-            raise ValueError(f"refusing to overwrite symlinked backup file: {backup_path}")
-        bak_fd, bak_tmp = tempfile.mkstemp(prefix=".backup-", suffix=".yaml.bak.tmp", dir=str(target.parent))
-        try:
-            with os.fdopen(bak_fd, "w", encoding="utf-8") as bfh:
-                bfh.write(raw_text)
-                bfh.flush()
-                os.fsync(bfh.fileno())
-            os.chmod(bak_tmp, 0o600)
-            os.replace(bak_tmp, backup_path)
-        except Exception:
-            if os.path.exists(bak_tmp):
-                os.unlink(bak_tmp)
-            raise
-
-    mcp_servers = existing.get("mcp_servers")
-    if mcp_servers is None:
-        mcp_servers = {}
-        existing["mcp_servers"] = mcp_servers
-    if not isinstance(mcp_servers, dict):
-        raise ValueError("top-level 'mcp_servers' in Hermes config must be a YAML mapping")
-
-    entry = build_hermes_mcp_entry(
-        binary=binary,
-        state_dir=state_dir,
-        timeout=timeout,
-        connect_timeout=connect_timeout,
-    )
-    mcp_servers["multiplayer"] = entry
-
-    rendered = yaml_mod.safe_dump(existing, sort_keys=False)
-    fd, tmp_name = tempfile.mkstemp(prefix=".config-", suffix=".yaml.tmp", dir=str(target.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(rendered)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, target)
-    except Exception:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-        raise
-
-    return {
-        "config_path": str(target),
-        "backup_path": str(backup_path) if backup_path is not None else None,
-        "entry": entry,
-    }
-
-
 def _default_sync_runner(argv: list[str], timeout_s: float) -> subprocess.CompletedProcess[str]:
+    is_hermes_cli = bool(argv) and Path(argv[0]).name == "hermes"
     return subprocess.run(
         argv,
         stdin=subprocess.DEVNULL,
@@ -233,6 +191,7 @@ def _default_sync_runner(argv: list[str], timeout_s: float) -> subprocess.Comple
         text=True,
         timeout=timeout_s,
         check=False,
+        env=None if is_hermes_cli else build_outpost_subprocess_env(),
     )
 
 
@@ -475,20 +434,32 @@ def handle_cli_command(
     if action == "setup":
         timeout = int(getattr(args, "timeout", DEFAULT_HERMES_MCP_TIMEOUT_S))
         connect_timeout = int(getattr(args, "connect_timeout", DEFAULT_HERMES_CONNECT_TIMEOUT_S))
+        hermes_bin = getattr(args, "hermes_binary", None) or "hermes"
+        add_argv = build_hermes_mcp_add_argv(
+            binary=bin_path,
+            state_dir=state_dir,
+            connect_timeout=connect_timeout,
+            hermes_binary=hermes_bin,
+        )
+        add_cmd_str = shlex.join(add_argv)
         if getattr(args, "write", False):
-            result = upsert_hermes_mcp_config(
-                cfg_path,
-                binary=bin_path,
-                state_dir=state_dir,
-                timeout=timeout,
-                connect_timeout=connect_timeout,
-            )
-            return (
-                0,
-                f"Updated {result['config_path']} with mcp_servers.multiplayer "
-                f"(timeout={timeout}s, connect_timeout={connect_timeout}s). "
-                "Run /reload-mcp in active Hermes sessions.",
-            )
+            try:
+                proc = run_cmd(add_argv, 30.0)
+            except FileNotFoundError:
+                return (
+                    127,
+                    f"Hermes CLI '{hermes_bin}' not found on PATH. Run manually:\n{add_cmd_str}",
+                )
+            except subprocess.TimeoutExpired:
+                return (124, f"Timed out running: {add_cmd_str}")
+            output = redact_url_fragments((proc.stdout or proc.stderr or "").strip())
+            if proc.returncode == 0:
+                summary = (
+                    f"Registered mcp_servers.multiplayer via `{add_cmd_str}`. "
+                    "Run /reload-mcp in active Hermes sessions."
+                )
+                return (0, f"{output}\n{summary}".strip() if output else summary)
+            return (proc.returncode, output or f"`{add_cmd_str}` exited with status {proc.returncode}.")
         snippet = render_hermes_mcp_snippet(
             binary=bin_path,
             state_dir=state_dir,
@@ -497,9 +468,9 @@ def handle_cli_command(
         )
         return (
             0,
-            f"# Preferred (preserves comments in config.yaml):\n"
-            f"hermes mcp add multiplayer -- {bin_path} mcp\n\n"
-            "# Or add to your Hermes YAML config (or re-run with --write), then run /reload-mcp:\n"
+            f"# Recommended (registers in active Hermes profile via Hermes CLI; or pass --write):\n"
+            f"{add_cmd_str}\n\n"
+            f"# Reference YAML entry for {default_hermes_config_path()} (recommended timeout: {timeout}s for party_wait <= 45s):\n"
             + snippet,
         )
 
@@ -682,7 +653,7 @@ def _cli_entrypoint(args: Any) -> int:
             argv.extend(["--device-label", clean_label])
         try:
             # Inherit stdio so the operator sees the browser sign-in URL and prompts live.
-            proc = subprocess.run(argv, check=False)
+            proc = subprocess.run(argv, check=False, env=build_outpost_subprocess_env(state_dir))
             return int(proc.returncode)
         except FileNotFoundError:
             print(f"mp-outpost binary '{bin_path}' not found on PATH.", file=sys.stderr)
@@ -861,7 +832,7 @@ def _setup_cli_parser(subparser: Any) -> None:
     subparser.add_argument("--session", default=DEFAULT_SESSION_NAME, help="Detached phux/tmux session name for chat (default: multiplayer-chat).")
     subparser.add_argument("--device-label", default=None, help="Optional device label for login.")
     subparser.add_argument("--trace", action="store_true", help="Include redacted MCP wiring trace in doctor.")
-    subparser.add_argument("--write", action="store_true", help="Write Hermes YAML config during setup.")
+    subparser.add_argument("--write", action="store_true", help="Invoke `hermes mcp add multiplayer` during setup.")
     subparser.add_argument("--config", default=None, help="Override Hermes config.yaml path.")
     subparser.add_argument("--binary", default="mp-outpost", help="Path to mp-outpost binary.")
     subparser.add_argument("--state-dir", default=None, help="Optional OUTPOST_STATE_DIR override.")
@@ -1018,7 +989,9 @@ __all__ = [
     "SecretRefusalError",
     "UnreadNotificationHook",
     "break_angle_runs",
+    "build_hermes_mcp_add_argv",
     "build_hermes_mcp_entry",
+    "build_outpost_subprocess_env",
     "clamp_wait_timeout_ms",
     "default_hermes_config_path",
     "detect_secret_kind",
@@ -1029,5 +1002,4 @@ __all__ = [
     "register",
     "render_hermes_mcp_snippet",
     "sanitize_peer_text",
-    "upsert_hermes_mcp_config",
 ]

@@ -159,7 +159,7 @@ class TestSecurityFramingAndSecrets(unittest.TestCase):
 class TestHermesTier1AndTier2(unittest.TestCase):
     """Tests for Tier 1 config upsert, Tier 2 CLI/unread hook, register(ctx), and YAML catalogs."""
 
-    def test_tier1_config_snippet_and_atomic_upsert(self) -> None:
+    def test_tier1_config_snippet_and_mcp_add_delegation(self) -> None:
         snippet = hermes.render_hermes_mcp_snippet(binary="/usr/local/bin/mp-outpost")
         parsed = yaml.safe_load(snippet)
         mp = parsed["mcp_servers"]["multiplayer"]
@@ -171,45 +171,67 @@ class TestHermesTier1AndTier2(unittest.TestCase):
         with self.assertRaises(ValueError):
             hermes.build_hermes_mcp_entry(timeout=30)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg_path = Path(tmp) / "config.yaml"
-            cfg_path.write_text(
-                yaml.safe_dump(
-                    {
-                        "agent": {"name": "hermes-dev"},
-                        "mcp_servers": {"other": {"command": "other-mcp", "args": []}},
-                    },
-                    sort_keys=False,
-                ),
-                encoding="utf-8",
-            )
-            res = hermes.upsert_hermes_mcp_config(
-                cfg_path,
-                binary="mp-outpost",
-                state_dir="/tmp/mp-state-test",
-                timeout=90,
-            )
-            self.assertEqual(res["config_path"], str(cfg_path))
-            self.assertIsNotNone(res["backup_path"])
-            bak_path = Path(res["backup_path"])
-            self.assertTrue(bak_path.is_file())
-            self.assertEqual(stat.S_IMODE(cfg_path.stat().st_mode), 0o600)
-            self.assertEqual(stat.S_IMODE(bak_path.stat().st_mode), 0o600)
+        argv = hermes.build_hermes_mcp_add_argv(
+            binary="mp-outpost",
+            state_dir="/tmp/mp-state-test",
+            connect_timeout=30,
+        )
+        self.assertEqual(
+            argv,
+            [
+                "hermes",
+                "mcp",
+                "add",
+                "multiplayer",
+                "--command",
+                "mp-outpost",
+                "--connect-timeout",
+                "30",
+                "--env",
+                "OUTPOST_STATE_DIR=/tmp/mp-state-test",
+                "--args",
+                "mcp",
+            ],
+        )
 
-            # Symlinked config paths must be refused.
-            sym_cfg = Path(tmp) / "link-config.yaml"
-            sym_cfg.symlink_to(cfg_path)
-            with self.assertRaises(ValueError):
-                hermes.upsert_hermes_mcp_config(sym_cfg)
+        # Verify minimal scrubbed subprocess env strips provider API keys while preserving PATH/HOME/locale/OUTPOST_STATE_DIR.
+        scrubbed = hermes.build_outpost_subprocess_env(
+            state_dir="/tmp/mp-state-test",
+            source_env={
+                "PATH": "/usr/bin",
+                "HOME": "/tmp/home",
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "OPENAI_API_KEY": "sk-secret",
+                "ANTHROPIC_API_KEY": "sk-ant-secret",
+                "NOUS_API_KEY": "nous-secret",
+                "GH_TOKEN": "gho-secret",
+            },
+        )
+        self.assertEqual(scrubbed["PATH"], "/usr/bin")
+        self.assertEqual(scrubbed["HOME"], "/tmp/home")
+        self.assertEqual(scrubbed["LANG"], "en_US.UTF-8")
+        self.assertEqual(scrubbed["LC_ALL"], "C.UTF-8")
+        self.assertEqual(scrubbed["OUTPOST_STATE_DIR"], "/tmp/mp-state-test")
+        for forbidden in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NOUS_API_KEY", "GH_TOKEN"):
+            self.assertNotIn(forbidden, scrubbed)
 
-            updated = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-            self.assertEqual(updated["agent"]["name"], "hermes-dev")
-            self.assertIn("other", updated["mcp_servers"])
-            self.assertEqual(updated["mcp_servers"]["multiplayer"]["timeout"], 90)
+        # Verify default_hermes_config_path honors hermes_constants.get_hermes_home().
+        import types
+
+        fake_mod = types.SimpleNamespace(get_hermes_home=lambda: Path("/tmp/custom-hermes-profile"))
+        prev = sys.modules.get("hermes_constants")
+        sys.modules["hermes_constants"] = fake_mod  # type: ignore[assignment]
+        try:
             self.assertEqual(
-                updated["mcp_servers"]["multiplayer"]["env"]["OUTPOST_STATE_DIR"],
-                "/tmp/mp-state-test",
+                hermes.default_hermes_config_path(),
+                Path("/tmp/custom-hermes-profile/config.yaml"),
             )
+        finally:
+            if prev is None:
+                sys.modules.pop("hermes_constants", None)
+            else:
+                sys.modules["hermes_constants"] = prev
 
     def test_tier2_unread_hook_advances_cursor_and_fences_messages(self) -> None:
         calls: list[list[str]] = []
@@ -325,24 +347,39 @@ class TestHermesTier1AndTier2(unittest.TestCase):
         self.assertTrue(Path(recorded["skills"][0][1]).is_file())
 
     def test_cli_setup_and_status_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = Path(tmp) / "config.yaml"
-            code, out = hermes.handle_cli_command(
-                SimpleNamespace(action="setup", write=True, config=str(cfg), binary="mp-outpost")
-            )
-            self.assertEqual(code, 0)
-            self.assertIn("timeout=90s", out)
-            self.assertTrue(cfg.is_file())
+        setup_calls: list[list[str]] = []
 
-            def mock_runner(argv: list[str], _t: float) -> subprocess.CompletedProcess[str]:
-                return subprocess.CompletedProcess(argv, 0, '{"daemon_epoch": 5}', "")
+        def setup_runner(argv: list[str], _t: float) -> subprocess.CompletedProcess[str]:
+            setup_calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "Added MCP server 'multiplayer'", "")
 
-            code2, out2 = hermes.handle_cli_command(
-                SimpleNamespace(action="status", json=True),
-                runner=mock_runner,
-            )
-            self.assertEqual(code2, 0)
-            self.assertEqual(json.loads(out2)["daemon_epoch"], 5)
+        code_print, out_print = hermes.handle_cli_command(
+            SimpleNamespace(action="setup", write=False, binary="mp-outpost")
+        )
+        self.assertEqual(code_print, 0)
+        self.assertIn("hermes mcp add multiplayer --command mp-outpost", out_print)
+        self.assertIn("--args mcp", out_print)
+
+        code, out = hermes.handle_cli_command(
+            SimpleNamespace(action="setup", write=True, binary="mp-outpost"),
+            runner=setup_runner,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("hermes mcp add multiplayer", out)
+        self.assertEqual(
+            setup_calls,
+            [["hermes", "mcp", "add", "multiplayer", "--command", "mp-outpost", "--connect-timeout", "30", "--args", "mcp"]],
+        )
+
+        def mock_runner(argv: list[str], _t: float) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, 0, '{"daemon_epoch": 5}', "")
+
+        code2, out2 = hermes.handle_cli_command(
+            SimpleNamespace(action="status", json=True),
+            runner=mock_runner,
+        )
+        self.assertEqual(code2, 0)
+        self.assertEqual(json.loads(out2)["daemon_epoch"], 5)
 
     def test_cli_one_verb_commands_and_pre_exec_refusals(self) -> None:
         recorded: list[tuple[list[str], float]] = []

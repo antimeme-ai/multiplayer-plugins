@@ -48,8 +48,8 @@ mp-outpost leave             # Leave active room
 
 ## Nous Research Hermes Agent (3-Tier Integration)
 
-1. **Tier 1 — MCP Wiring (`~/.hermes/config.yaml`):**
-   `hermes multiplayer setup --write` atomically upserts `mcp_servers.multiplayer` with `timeout: 90` and `connect_timeout: 30` (preserving existing keys and creating a mode-`0600` `.bak` backup) so `party_wait` (max `45000` ms) never hits a premature client timeout. Run `/reload-mcp` inside active Hermes sessions.
+1. **Tier 1 — MCP Wiring (`hermes mcp add`):**
+   `hermes multiplayer setup` prints the exact `hermes mcp add multiplayer --command mp-outpost --connect-timeout 30 --args mcp` command and reference YAML snippet (and passing `--write` invokes `hermes mcp add` directly for the active Hermes profile without rewriting `config.yaml` directly). Run `/reload-mcp` inside active Hermes sessions.
 2. **Tier 2 — Native CLI, Slash Commands, Secret Redaction & Unread Hook:**
    Registers `hermes multiplayer {login, add, invite, join, leave, friends, setup, status, doctor, parties, inbox, policy}`, in-session slash commands (`/party-status`, `/party-invite`, `/party-join`, `/party-leave`, `/party-friends`, `/party-read`), additive secret redaction patterns via `ctx.register_redaction_patterns(...)`, and a non-blocking `pre_llm_call` unread-message pulse check (`UnreadNotificationHook`) returning Hermes `{"context": "..."}` payloads with CSPRNG nonce fences, `is_browser` origin tagging, and `is_historical_catchup` markers.
 3. **Tier 3 — Gateway Platform Adapter (`MultiplayerPlatformAdapter`):**

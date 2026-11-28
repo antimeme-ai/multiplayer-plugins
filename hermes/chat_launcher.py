@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from .security import (
     SecretRefusalError,
+    build_outpost_subprocess_env,
     redact_url_fragments,
     refuse_secrets,
     sanitize_peer_text,
@@ -335,7 +336,7 @@ def run_chat_in_place(
         argv.append(clean_target)
 
     def _run() -> int:
-        proc = subprocess.run(argv, check=False)
+        proc = subprocess.run(argv, check=False, env=build_outpost_subprocess_env(state_dir))
         return int(proc.returncode)
 
     try:
@@ -445,6 +446,7 @@ class InlinePartyWatcher:
                 text=True,
                 timeout=timeout_s,
                 check=False,
+                env=build_outpost_subprocess_env(self.state_dir),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return None, redact_url_fragments(str(exc))
@@ -656,6 +658,7 @@ class InlinePartyWatcher:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    env=build_outpost_subprocess_env(self.state_dir),
                 )
                 with self._lock:
                     self._proc = proc

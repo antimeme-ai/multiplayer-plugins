@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Final
 
 from .security import (
     SecretRefusalError,
+    build_outpost_subprocess_env,
     fence_peer_text,
     redact_payload,
     redact_url_fragments,
@@ -318,6 +319,7 @@ class MultiplayerPlatformAdapter(BasePlatformAdapter):  # type: ignore[misc]
             stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=build_outpost_subprocess_env(self.state_dir),
         )
         self._active_procs.add(proc)
         try:
