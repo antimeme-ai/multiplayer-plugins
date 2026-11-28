@@ -976,13 +976,19 @@ class TestMultiHostPlugins(unittest.TestCase):
                 const ocOut = await ocCmds.get("party-chat").handler({{ args: "" }});
                 assert.ok(ocOut.text.includes("already running") && ocOut.text.includes("phux attach multiplayer-chat"));
 
-                // OpenCode TUI plugin registers global ctrl+alt+m, palette, /party-chat, and fires toast
+                // OpenCode TUI plugin registers global ctrl+alt+m, palette, /party-chat via ui.slot({{ append: "app" }}) and fires toast
                 const layers = [];
                 const toasts = [];
+                const slots = [];
                 opencodeTui.setup({{
                   keymap: {{ layer(factory) {{ layers.push(factory()); }} }},
-                  ui: {{ toast: {{ show(t) {{ toasts.push(t); }} }} }},
+                  ui: {{
+                    toast: {{ show(t) {{ toasts.push(t); }} }},
+                    slot(spec) {{ slots.push(spec); spec.render(); }},
+                  }},
                 }});
+                assert.equal(slots.length, 1);
+                assert.equal(slots[0].append, "app");
                 assert.equal(layers[0].mode, "global");
                 const chatCmd = layers[0].commands.find((c) => c.id === "multiplayer.chat");
                 assert.equal(chatCmd.bind, "ctrl+alt+m");

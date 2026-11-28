@@ -41,6 +41,7 @@ export interface OpenCodeTuiContext {
   };
   readonly ui: {
     readonly toast: OpenCodeTuiToast;
+    readonly slot?: (spec: { readonly append?: string; readonly prepend?: string; readonly render: () => unknown }) => void;
   };
 }
 
@@ -308,39 +309,51 @@ export async function launchDetachedPartyChat(options?: {
 const tuiPlugin = {
   id: "antimeme-ai.multiplayer",
   setup(context: OpenCodeTuiContext): void {
-    context.keymap.layer(() => ({
-      mode: "global",
-      commands: [
-        {
-          id: "multiplayer.chat",
-          title: "Open Multiplayer Party Chat",
-          description: "Launch mp-outpost chat in a detached phux window (tmux/Omarchy fallback)",
-          group: "Multiplayer",
-          bind: "ctrl+alt+m",
-          palette: true,
-          slash: { name: "party-chat", aliases: ["mp-chat"], arguments: true },
-          suggested: true,
-          async run(input?: string) {
-            try {
-              const res = await launchDetachedPartyChat({ target: input?.trim() || undefined });
-              context.ui.toast.show({
-                title: "Multiplayer Party Chat",
-                message: res.message,
-                variant: res.ok ? "success" : "warning",
-                duration: 6000,
-              });
-            } catch (err) {
-              context.ui.toast.show({
-                title: "Multiplayer Party Chat",
-                message: (err as Error).message,
-                variant: "error",
-                duration: 6000,
-              });
-            }
+    const registerLayer = () => {
+      context.keymap.layer(() => ({
+        mode: "global",
+        commands: [
+          {
+            id: "multiplayer.chat",
+            title: "Open Multiplayer Party Chat",
+            description: "Launch mp-outpost chat in a detached phux window (tmux/Omarchy fallback)",
+            group: "Multiplayer",
+            bind: "ctrl+alt+m",
+            palette: true,
+            slash: { name: "party-chat", aliases: ["mp-chat"], arguments: true },
+            suggested: true,
+            async run(input?: string) {
+              try {
+                const res = await launchDetachedPartyChat({ target: input?.trim() || undefined });
+                context.ui.toast.show({
+                  title: "Multiplayer Party Chat",
+                  message: res.message,
+                  variant: res.ok ? "success" : "warning",
+                  duration: 6000,
+                });
+              } catch (err) {
+                context.ui.toast.show({
+                  title: "Multiplayer Party Chat",
+                  message: (err as Error).message,
+                  variant: "error",
+                  duration: 6000,
+                });
+              }
+            },
           },
-        },
-      ],
-    }));
+        ],
+      }));
+      return null;
+    };
+
+    if (typeof context.ui?.slot === "function") {
+      context.ui.slot({
+        append: "app",
+        render: registerLayer,
+      });
+    } else {
+      registerLayer();
+    }
   },
 };
 
