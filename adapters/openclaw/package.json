@@ -16,7 +16,13 @@
     "README.md"
   ],
   "openclaw": {
-    "extensions": ["./index.ts"]
+    "extensions": ["./index.ts"],
+    "compat": {
+      "pluginApi": ">=2026.3.2"
+    },
+    "build": {
+      "openclawVersion": "2026.3.2"
+    }
   },
   "repository": {
     "type": "git",
