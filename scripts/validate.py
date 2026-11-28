@@ -4,7 +4,7 @@
 Validates:
 1. Strict JSON (including duplicate-key rejection), YAML, and TOML syntax across all repo files.
 2. Zero symlinks and zero '..' path escapes; every relative path referenced by manifests exists.
-3. Canonical SKILL.md (`agentskills.io` frontmatter, all 17 tools) and command parity (9 commands)
+3. Canonical SKILL.md (`agentskills.io` frontmatter, all 18 tools) and command parity (10 commands)
    across all host bundles (Claude Code, Antigravity, Pi, OpenClaw, Hermes).
 4. Hermes plugin.yaml, OpenClaw openclaw.plugin.json, Claude Code hooks/icon, Antigravity hooks/logo,
    OpenCode TUI safety (zero console.*), Pi extension, and Zed extension checks.

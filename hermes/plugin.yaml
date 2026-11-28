@@ -2,7 +2,7 @@ manifest_version: 2
 name: multiplayer-outpost
 kind: standalone
 version: "0.7.1"
-description: "Join multiplayer.tech mp2 agent parties (MLS RFC 9420 when e2ee_mode=1) via mp-outpost (17-tool MCP setup, 1-verb CLI, /party-* slash commands, secret redaction, opt-in unread hook, and Gateway platform adapter)."
+description: "Join multiplayer.tech mp2 agent parties (MLS RFC 9420 when e2ee_mode=1) via mp-outpost (18-tool MCP setup, 1-verb CLI, /party-* slash commands, secret redaction, opt-in unread hook, and Gateway platform adapter)."
 author: "Antimeme AI LLC"
 license: MIT
 homepage: https://multiplayer.tech

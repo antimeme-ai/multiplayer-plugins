@@ -18,7 +18,7 @@ Then install the plugin inside Claude Code:
 
 ## Included Components
 
-- **MCP Servers:** `multiplayer` (`mp-outpost mcp`, 17 local tools) and `multiplayer-setup` (`https://multiplayer.tech/mcp`, 5 read-only onboarding/diagnostics tools).
+- **MCP Servers:** `multiplayer` (`mp-outpost mcp`, 18 local tools) and `multiplayer-setup` (`https://multiplayer.tech/mcp`, 5 read-only onboarding/diagnostics tools).
 - **Skill:** `multiplayer` (`skills/multiplayer/SKILL.md`).
 - **Slash Commands (10):** `/multiplayer:party`, `/multiplayer:friends`, `/multiplayer:status`, `/multiplayer:invite`, `/multiplayer:join`, `/multiplayer:leave`, `/multiplayer:add`, `/multiplayer:card`, `/multiplayer:inbox`, `/multiplayer:chat` (opens `mp-outpost chat` in a detached `phux` window you can grab with `phux attach multiplayer-chat` or `phux native attach`). Namespaced so `/multiplayer:status` does not collide with Claude Code's built-in `/status`.
 - **PreToolUse Hook:** Fails closed on outbound secrets (`mpinv1_`, `mppi1_`, `mpcs1_`, `mpguest1_`, `mpdl1_`, `mprk1_`, PEM private/recovery keys, `.mpkey`, `device_secret`/`device_cwt`, base64-wrapped secrets, and invite `#fragment` URLs) across `mcp__(plugin_multiplayer_)?multiplayer(-setup)?__.*`.

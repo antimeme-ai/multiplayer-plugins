@@ -4,7 +4,7 @@
  * - Compatible with upstream Pi (`@earendil-works/pi-coding-agent`) and Oh-My-Pi
  *   (`@oh-my-pi/pi-coding-agent`): uses `ctx.ui.notify(...)` (with `ctx.notify`
  *   fallback) and `(event, ctx)` event handler signatures.
- * - Registers all 17 LLM-callable tools via `pi.registerTool(...)` plus 10
+ * - Registers all 18 LLM-callable tools via `pi.registerTool(...)` plus 11
  *   interactive slash commands via `pi.registerCommand(...)`, `tool_call` pre-exec
  *   secret refusal, and `before_agent_start` provenance guidance.
  * - Uses `spawn(..., { shell: false })` exclusively (zero shell interpolation),
